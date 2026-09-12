@@ -192,95 +192,49 @@ and see the following (reduced) output
 ```
 
 ## To use Triton-distributed with the Ascend backend:
-#### Ascend Build from source
-1. Clone the repo
+#### Vendored offline build
+
+All Ascend build dependencies are vendored under `3rdparty/` (`llvm-project`,
+`triton-ascend`, `AscendNPU-IR`, `shmem`, `nlohmann-json` -- pinned versions,
+pre-applied patches and trims are documented in `3rdparty/VENDORED.md`), so
+the build itself requires **no network access** (no github/gitcode clones, no
+LLVM tarballs, no PyPI downloads).
+
+1. One-time vendoring -- run on a networked **Linux** machine, then commit
+   (the script also converts `3rdparty/triton-ascend` and `3rdparty/shmem`
+   from submodules to plain directories and stages everything):
+
 ```sh
-git clone https://github.com/ByteDance-Seed/Triton-distributed.git
-```
-2. Update submodules
-```sh
-cd Triton-distributed/
-git submodule update --init --depth=1
-# 3rdparty/shmem and 3rdparty/triton-ascend's submodules are hosted on gitcode.com and
-# are marked `update = none` in .gitmodules, so the command above skips them (this
-# keeps CI environments that cannot reach gitcode.com from failing at submodule
-# init). Fetch them explicitly for an Ascend build (--checkout overrides `none`):
-git submodule update --init --checkout --depth=1 3rdparty/triton-ascend 3rdparty/shmem
-cd 3rdparty/triton-ascend
-git submodule update --init --depth=1
-```
-3. Install dependencies
-
-triton-ascend depends on specified LLVM version
-- step 1：Build LLVM with clang and lld：
-
-  ```bash
-  apt-get install -y clang-15 lld-15 ccache
-  ```
-
-- step 2：set LLVM_INSTALL_PREFIX：
-
-   ```bash
-   export LLVM_INSTALL_PREFIX=/path/to/llvm-install
-   ```
-
-- step 3：Build and Install LLVM：
-
-  ```bash
-  git clone --no-checkout https://github.com/llvm/llvm-project.git
-  cd llvm-project
-  git checkout fad3272286528b8a491085183434c5ad4b59ab92
-  wget https://raw.gitcode.com/Ascend/triton-ascend/blobs/2b0a06eb21438359d6d0576b622e3bb5e0292d17/fad3272.patch
-  git apply fad3272.patch
-  mkdir build
-  cd build
-  cmake ../llvm \
-    -G Ninja \
-    -DCMAKE_C_COMPILER=/usr/bin/clang-15 \
-    -DCMAKE_CXX_COMPILER=/usr/bin/clang++-15 \
-    -DCMAKE_LINKER=/usr/bin/lld-15 \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DLLVM_ENABLE_ASSERTIONS=ON \
-    -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld" \
-    -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU" \
-    -DLLVM_ENABLE_LLD=ON \
-    -DCMAKE_INSTALL_PREFIX=${LLVM_INSTALL_PREFIX}
-  ninja install
-  ```
-
-- step 4：copy FileCheck and llvm-lit to Install directory：
-
-   ```bash
-   cp  {PATH_TO}/llvm_project/build/bin/FileCheck ${LLVM_INSTALL_PREFIX}/bin/FileCheck
-   cp  {PATH_TO}/llvm_project/build/bin/llvm-lit ${LLVM_INSTALL_PREFIX}/bin/llvm-lit
-   ```
-
-- step 5：build AscendNPU-IR：
-  ```bash
-  source /usr/local/Ascend/ascend-toolkit/set_env.sh
-  git clone https://gitcode.com/Ascend/AscendNPU-IR.git
-  cd AscendNPU-IR
-  git submodule update --init --depth=1
-  mkdir build
-  ./build-tools/build.sh -o ./build -t --build-type Release --apply-patches --bisheng-compile=$ASCEND_HOME_PATH/bin --build-shmem-template
-  ```
-4. Build Triton-distributed
-```sh
-cd {PATH_TO}/Triton-distributed
-LLVM_SYSPATH=${LLVM_INSTALL_PREFIX} TRITON_BUILD_WITH_CLANG_LLD=ON TRITON_BUILD_PROTON=OFF TRITON_BUILD_LITTLE_KERNEL=OFF TRITON_USE_ASCEND=ON TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF" pip install ./python
+bash scripts/vendor_deps.sh
+git status && git diff --cached --stat | tail -5
+git commit -m "vendor: offline Ascend build dependencies"
 ```
 
-5. Build and Install shmem
+2. Build on the Atlas A3 (910B) host or inside the CANN container
+   (e.g. `quay.io/ascend/triton:3.2.2-cann9.1.0-torch_npu2.7.1.post8-a3-ubuntu24.04-py3.11`):
+
 ```sh
-cd 3rdparty/shmem
-bash scripts/build.sh -python_extension
-pip install dist/shmem-xxx.whl
+bash scripts/build_ascend_a3.sh              # resumable via stamp files
+RUN_TESTS=1 bash scripts/build_ascend_a3.sh  # also run pytest at the end
+FORCE=1 bash scripts/build_ascend_a3.sh      # ignore stamps, rebuild all
 ```
+
+The script checks prerequisites (npu-smi, CANN env, torch/torch_npu, pybind11,
+clang/lld, cmake>=3.28, ninja>=1.12), then builds in order: the vendored LLVM
+(`3rdparty/llvm-project`, triton-ascend's llvm patch pre-applied, built with
+tests disabled), AscendNPU-IR/bisheng (from a `WORK_ROOT` copy of
+`3rdparty/AscendNPU-IR`, its own llvm patches pre-applied), Triton-distributed
+(`pip install -e ./python` with `TRITON_USE_ASCEND=ON TRITON_OFFLINE_BUILD=1
+JSON_SYSPATH=3rdparty/nlohmann-json LLVM_SYSPATH=...`) and the shmem python
+extension, finishing with `scripts/probe_ascend_language_api.py`. See the
+header of `scripts/build_ascend_a3.sh` for all overridable environment
+variables (`WORK_ROOT`, `REPO_DIR`, `JOBS`, `CANN_ENV`, `PIP_NO_INDEX`, ...).
+
 ### Test Ascend Installation
 #### Allgather GEMM example on single node
 ```sh
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
-export PATH=$HOME/AscendNPU-IR/build/bin:$PATH
+export PATH=$HOME/ascend-build/AscendNPU-IR/build/bin:$PATH
 torchrun --nproc-per-node=2 tutorials/ascend/01-ascend-allgather-gemm.py
 ```
 and see the following (reduced) output

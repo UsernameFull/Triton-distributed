@@ -1,0 +1,15 @@
+# 运行 examples/ 下 Python 示例所需的额外依赖（按需安装）
+#
+# 来源说明（grep examples/ 实际 import）：
+#   ml_dtypes   : examples/allgather/scripts/data_gen.py（bfloat16 数据生成）
+#                 examples/multi_instance/utils/data_gen.py（bfloat16 数据生成）
+#   pandas      : examples/allgather/scripts/data_statistic.py
+#                 examples/utils/perf_data_process.py
+#                 examples/dynamic_tiling/utils/process_data.py
+#                 examples/dynamic_tiling/utils/get_best_result.py
+#   matplotlib  : examples/utils/perf_data_process.py（性能数据可视化）
+#   seaborn     : examples/utils/perf_data_process.py（性能数据可视化）
+ml_dtypes
+pandas
+matplotlib
+seaborn

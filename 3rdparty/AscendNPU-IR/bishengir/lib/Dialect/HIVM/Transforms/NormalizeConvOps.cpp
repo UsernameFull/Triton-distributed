@@ -1,0 +1,963 @@
+//===- NormalizeConvOps.cpp - normalize hivm conv ops ---------------------===//
+//
+// Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
+//===----------------------------------------------------------------------===//
+
+#include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
+#include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+#include "bishengir/Dialect/HIVM/Utils/Utils.h"
+#include "bishengir/Dialect/Utils/Util.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/PatternMatch.h"
+#include "mlir/Support/LLVM.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+#include "llvm/Support/Casting.h"
+
+#include <memory>
+
+namespace mlir {
+#define GEN_PASS_DEF_NORMALIZECONVOPS
+#include "bishengir/Dialect/HIVM/Transforms/Passes.h.inc"
+} // namespace mlir
+
+using namespace mlir;
+using namespace mlir::hivm;
+
+#define DEBUG_TYPE "hivm-normalize-convops"
+#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
+
+namespace {
+static constexpr llvm::StringLiteral outputAlreadyNormalized =
+    "outputAlreadyNormalized";
+
+inline RoundModeAttr getRoundAttr(mlir::OpBuilder &b, Type srcType,
+                                  Type dstType) {
+  return hivm::RoundModeAttr::get(
+      b.getContext(),
+      mlir::utils::selectRoundMode<hivm::RoundMode>(srcType, dstType));
+}
+
+LogicalResult expandToBatch(hivm::Conv1DL1Op op, PatternRewriter &rewriter) {
+  auto input = op.getInput();
+  auto inputType = cast<ShapedType>(input.getType());
+  auto elementType = inputType.getElementType();
+  const int64_t batch = 1;
+
+  // expand [iC, iW] -> [N, iC, iW]
+  auto iC = inputType.getDimSize(0);
+  auto iW = inputType.getDimSize(1);
+  SmallVector<int64_t> newShapeInput{batch, iC, iW};
+  SmallVector<SmallVector<int64_t, 2>> reassoc = {{0, 1}, {2}};
+  auto expandShapeOp = rewriter.create<tensor::ExpandShapeOp>(
+      op->getLoc(), RankedTensorType::get(newShapeInput, elementType), input,
+      reassoc);
+  op->replaceUsesOfWith(input, expandShapeOp->getResults()[0]);
+
+  return success();
+}
+
+LogicalResult padForInput(hivm::Conv1DL1Op op, PatternRewriter &rewriter,
+                          int64_t groups, int64_t C) {
+  auto input = op.getInput();
+  auto inputType = cast<ShapedType>(input.getType());
+  auto elementType = inputType.getElementType();
+  auto batch = inputType.getDimSize(0);
+  int64_t iC = inputType.getDimSize(1);
+  int64_t iW = inputType.getDimSize(2);
+
+  // expand [N, iC, iW] -> [N, G, iC/G, iW]
+  SmallVector<int64_t> newShapeInput{batch, groups, iC / groups, iW};
+  SmallVector<SmallVector<int64_t, 2>> reassoc = {{0}, {1, 2}, {3}};
+  auto expandShapeOp = rewriter.create<tensor::ExpandShapeOp>(
+      op->getLoc(), RankedTensorType::get(newShapeInput, elementType), input,
+      reassoc);
+
+  // create [N, G, C/G-iC/G, iW]
+  auto emptyOp = rewriter.create<tensor::EmptyOp>(
+      op->getLoc(), ArrayRef<int64_t>{batch, groups, (C - iC) / groups, iW},
+      elementType);
+  auto zero = rewriter.create<arith::ConstantOp>(
+      op->getLoc(), rewriter.getZeroAttr(elementType));
+  auto hivmVBrcOp = rewriter.create<hivm::VBrcOp>(
+      op->getLoc(), emptyOp->getResultTypes(), zero, emptyOp->getResults()[0],
+      rewriter.getDenseI64ArrayAttr(ArrayRef<int64_t>{}));
+
+  // concat [N, G, iC/G, iW] + [N, G, C/G-iC/G, iW] -> [N, G, C/G, iW]
+  auto emptyOp1 = rewriter.create<tensor::EmptyOp>(
+      op->getLoc(), ArrayRef<int64_t>{batch, groups, C / groups, iW},
+      elementType);
+  auto concatOp = rewriter.create<hivm::VConcatOp>(
+      op->getLoc(), emptyOp1->getResultTypes(), rewriter.getI64IntegerAttr(2),
+      ValueRange{expandShapeOp->getResults()[0], hivmVBrcOp->getResults()[0]},
+      emptyOp1->getResults()[0]);
+
+  // collapse [N, G, C/G, iW] -> [N, C, iW]
+  SmallVector<int64_t> newShapeInput1{batch, C, iW};
+  SmallVector<SmallVector<int64_t, 2>> reassoc1 = {{0}, {1, 2}, {3}};
+  auto collapseOp = rewriter.create<tensor::CollapseShapeOp>(
+      op->getLoc(), RankedTensorType::get(newShapeInput1, elementType),
+      concatOp->getResults()[0], reassoc1);
+
+  op->replaceUsesOfWith(input, collapseOp.getResult());
+  return success();
+}
+
+LogicalResult insertPadExpandTransToFormatInput(hivm::Conv1DL1Op op,
+                                                PatternRewriter &rewriter,
+                                                int64_t C0, int64_t C,
+                                                int64_t groups) {
+  auto input = op.getInput();
+  auto inputType = cast<ShapedType>(input.getType());
+  Type elementType = inputType.getElementType();
+  auto batch = inputType.getDimSize(0);
+  int64_t iC = inputType.getDimSize(1);
+  int64_t iW = inputType.getDimSize(2);
+  if (iC != C) {
+    // need padding
+    if (failed(padForInput(op, rewriter, groups, C))) {
+      return failure();
+    }
+  }
+
+  input = op.getInput();
+
+  // expand [N, C, iW] -> [N, C1, C0, iW]
+  int64_t C1 = C / C0;
+  SmallVector<int64_t> newShapeInput{batch, C1, C0, iW};
+  SmallVector<SmallVector<int64_t, 2>> reassoc = {{0}, {1, 2}, {3}};
+  auto expandShapeOp = rewriter.create<tensor::ExpandShapeOp>(
+      op->getLoc(), RankedTensorType::get(newShapeInput, elementType), input,
+      reassoc);
+
+  // trans [N, C1, C0, iW] -> [N, C1, iW, C0]
+  // (0, 1, 3, 2)
+  SmallVector<int64_t, 4> newPerm{0, 1, 3, 2};
+  auto dst = rewriter.create<tensor::EmptyOp>(
+      op->getLoc(), ArrayRef<int64_t>{batch, C1, iW, C0}, elementType);
+  auto vtransposeOp = rewriter.create<hivm::VTransposeOp>(
+      op->getLoc(), TypeRange{dst.getResult().getType()},
+      expandShapeOp.getResult(), dst.getResult(),
+      rewriter.getDenseI64ArrayAttr(newPerm));
+
+  // expand [N, C1, iW, C0] -> [N, C1, 1, iW, C0]
+  SmallVector<int64_t> newShapeInput1{batch, C1, 1, iW, C0};
+  SmallVector<SmallVector<int64_t, 2>> reassoc1 = {{0}, {1, 2}, {3}, {4}};
+  auto expandShapeOp1 = rewriter.create<tensor::ExpandShapeOp>(
+      op->getLoc(), RankedTensorType::get(newShapeInput1, elementType),
+      vtransposeOp->getResults()[0], reassoc1);
+
+  op->replaceUsesOfWith(input, expandShapeOp1->getResult(0));
+
+  return success();
+}
+
+LogicalResult insertPadExpandTransToFormatWeight(hivm::Conv1DL1Op op,
+                                                 PatternRewriter &rewriter,
+                                                 int64_t C0, int64_t groups,
+                                                 int64_t C) {
+  auto weight = op.getWeight();
+  auto weightType = cast<ShapedType>(weight.getType());
+  auto elementType = weightType.getElementType();
+  auto oC = weightType.getDimSize(0);
+  auto channelsPerGroup = weightType.getDimSize(1);
+  auto wW = weightType.getDimSize(2);
+
+  if (channelsPerGroup * groups != C) {
+    // need padding
+    int64_t newChannelsPerGroup = C / groups;
+
+    // create [oC, (C-iC)/G, wW]
+    auto emptyOp = rewriter.create<tensor::EmptyOp>(
+        op->getLoc(),
+        ArrayRef<int64_t>{oC, newChannelsPerGroup - channelsPerGroup, wW},
+        elementType);
+    auto zero = rewriter.create<arith::ConstantOp>(
+        op->getLoc(), rewriter.getZeroAttr(elementType));
+    auto hivmVBrcOp = rewriter.create<hivm::VBrcOp>(
+        op->getLoc(), emptyOp->getResultTypes(), zero, emptyOp->getResults()[0],
+        rewriter.getDenseI64ArrayAttr(ArrayRef<int64_t>{}));
+
+    // concat [oC, iC/G, wW] + [oC, (C-iC)/G, wW] -> [oC, C/G, wW]
+    auto emptyOp1 = rewriter.create<tensor::EmptyOp>(
+        op->getLoc(), ArrayRef<int64_t>{oC, newChannelsPerGroup, wW},
+        elementType);
+    auto concatOp = rewriter.create<hivm::VConcatOp>(
+        op->getLoc(), emptyOp1->getResultTypes(), rewriter.getI64IntegerAttr(1),
+        ValueRange{weight, hivmVBrcOp->getResults()[0]},
+        emptyOp1->getResults()[0]);
+
+    op->replaceUsesOfWith(weight, concatOp->getResults()[0]);
+  }
+
+  weight = op.getWeight();
+
+  // expand [oC, C/groups, wW] -> [oC, C1/groups, C0, wW]
+  int64_t newChannelsPerGroup = C / groups / C0;
+  SmallVector<int64_t> newShape{oC, newChannelsPerGroup, C0, wW};
+  SmallVector<SmallVector<int64_t, 2>> reassoc = {{0}, {1, 2}, {3}};
+  auto expandShapeOp = rewriter.create<tensor::ExpandShapeOp>(
+      op->getLoc(), RankedTensorType::get(newShape, elementType), weight,
+      reassoc);
+
+  // trans [oC, C1/groups, C0, wW] -> [C1/groups, oC, C0, wW]
+  SmallVector<int64_t, 4> newPerm{1, 0, 2, 3};
+  auto dst = rewriter.create<tensor::EmptyOp>(
+      op->getLoc(), ArrayRef<int64_t>{newChannelsPerGroup, oC, C0, wW},
+      elementType);
+  auto vtransposeOp = rewriter.create<hivm::VTransposeOp>(
+      op->getLoc(), TypeRange{dst.getResult().getType()},
+      expandShapeOp.getResult(), dst.getResult(),
+      rewriter.getDenseI64ArrayAttr(newPerm));
+
+  // trans [C1/groups, oC, C0, wW] -> [C1/groups, oC, wW, C0]
+  SmallVector<int64_t, 4> newPerm1{0, 1, 3, 2};
+  auto dst1 = rewriter.create<tensor::EmptyOp>(
+      op->getLoc(), ArrayRef<int64_t>{newChannelsPerGroup, oC, wW, C0},
+      elementType);
+  auto vtransposeOp1 = rewriter.create<hivm::VTransposeOp>(
+      op->getLoc(), TypeRange{dst1.getResult().getType()},
+      vtransposeOp.getResult()[0], dst1.getResult(),
+      rewriter.getDenseI64ArrayAttr(newPerm1));
+
+  // trans [C1/groups, oC, wW, C0] -> [C1/groups, wW, oC, C0]
+  SmallVector<int64_t, 4> newPerm2{0, 2, 1, 3};
+  auto dst2 = rewriter.create<tensor::EmptyOp>(
+      op->getLoc(), ArrayRef<int64_t>{newChannelsPerGroup, wW, oC, C0},
+      elementType);
+  auto vtransposeOp2 = rewriter.create<hivm::VTransposeOp>(
+      op->getLoc(), TypeRange{dst2.getResult().getType()},
+      vtransposeOp1.getResult()[0], dst2.getResult(),
+      rewriter.getDenseI64ArrayAttr(newPerm2));
+
+  // expand [C1/groups, wW, oC, C0] -> [C1/groups, 1, wW, oC, C0]
+  SmallVector<int64_t> newShape1{newChannelsPerGroup, 1, wW, oC, C0};
+  SmallVector<SmallVector<int64_t, 2>> reassoc1 = {{0, 1}, {2}, {3}, {4}};
+  auto expandShapeOp1 = rewriter.create<tensor::ExpandShapeOp>(
+      op->getLoc(), RankedTensorType::get(newShape1, elementType),
+      vtransposeOp2.getResult()[0], reassoc1);
+
+  op->replaceUsesOfWith(weight, expandShapeOp1->getResult(0));
+  return success();
+}
+
+LogicalResult getElementsFor32ByteAlignment(Type elementType, int64_t &C0) {
+  if (!elementType || !elementType.isIntOrFloat()) {
+    return failure();
+  }
+  const int64_t bytesize = 8;
+  auto elementSize = CEIL_DIV(elementType.getIntOrFloatBitWidth(), bytesize);
+  if (elementSize == 0) {
+    return failure();
+  }
+
+  constexpr int64_t k32ByteAlignment = 32;
+  C0 = CEIL_DIV(k32ByteAlignment, elementSize);
+
+  return success();
+}
+
+
+/// This pattern normalizes the input and weight layout of hivm::Conv1DL1Op
+/// by padding and transforming them to fractal format for hardware execution.
+///
+/// Motivation:
+///   The original Conv1DL1 expects input and weight in logical layout:
+///     - input:  [B, iC, iW] or [iC, iW] (without batch)
+///     - weight: [oC, iC, wW] or [oC, iC/groups, wW] (grouped)
+///   For hardware execution, input and weight need to be transformed to
+///   fractal format with 32-byte alignment:
+///     - input:  [B, C1, C0, iW] where C0 = 32-byte alignment factor
+///     - weight: [oC, C1/groups, C0, wW] where C0 = 32-byte alignment factor
+///
+/// Rewrite overview:
+///   1. Calculate alignment factor C0 based on element type for 32-byte alignment
+///   2. Expand input to batch dimension if needed ([iC, iW] -> [1, iC, iW])
+///   3. Transform input to fractal format:
+///        [B, iC, iW] -> [B, C1, C0, iW]
+///      where:
+///        - C1 = ceil(iC / C0)
+///        - C0 = 32-byte alignment factor
+///   4. Transform weight to fractal format:
+///        [oC, iC/groups, wW] -> [oC, C1/groups, C0, wW]
+///      with appropriate transpose operations
+///
+/// Semantics:
+///   This pattern only changes the physical layout of input and weight tensors
+///   for hardware efficiency. The numerical semantics of the convolution
+///   operation remain unchanged.
+///
+/// In short:
+///   logical layout -> padded & transformed fractal layout (for hardware)
+struct NormalizeConvInputAndWeightPattern
+    : public OpRewritePattern<hivm::Conv1DL1Op> {
+public:
+  using OpRewritePattern<hivm::Conv1DL1Op>::OpRewritePattern;
+  LogicalResult matchAndRewrite(hivm::Conv1DL1Op op,
+                                PatternRewriter &rewriter) const override {
+    if (op->getNumOperands() < 3) {
+      return op.emitError() << "Operation " << op->getName()
+                            << " requires at least 3 operands, but got "
+                            << op->getNumOperands();
+    }
+    auto input = op.getInput();
+    auto weight = op.getWeight();
+
+    if (!isa<ShapedType>(input.getType())) {
+      return op.emitError("Expected ShapedType for input, but got: ")
+             << input.getType();
+    }
+
+    if (!isa<ShapedType>(weight.getType())) {
+      return op.emitError("Expected ShapedType for weight, but got: ")
+             << weight.getType();
+    }
+
+    auto inputType = cast<ShapedType>(input.getType());
+    if (!inputType.hasStaticShape() || inputType.getRank() == 5) {
+      return failure();
+    }
+
+    auto weightType = cast<ShapedType>(weight.getType());
+    if (!weightType.hasStaticShape() || weightType.getRank() == 5) {
+      return failure();
+    }
+
+    if (inputType.getElementType() != weightType.getElementType()) {
+      return op.emitError("Element type mismatch: input has ")
+             << inputType.getElementType() << " but weight has "
+             << weightType.getElementType();
+    }
+
+    int64_t C0 = 0;
+    if (failed(getElementsFor32ByteAlignment(inputType.getElementType(), C0))) {
+      return op.emitError(
+          "Failed to calculate 32-byte alignment for element type");
+    }
+
+    if (!op->hasAttr("groups")) {
+      return op.emitError("Expected Attr named groups for Conv1D op");
+    }
+
+    if (!isa<IntegerAttr>(op->getAttr("groups"))) {
+      return op.emitError("Expected IntegerType for Attr 'groups'");
+    }
+
+    // set insert loc before the define of out operand
+    auto *outDefOp = op.getInit().getDefiningOp();
+    if (outDefOp) {
+      rewriter.setInsertionPoint(outDefOp);
+    }
+
+    if (inputType.getRank() == 2) {
+      if (failed(expandToBatch(op, rewriter))) {
+        return rewriter.notifyMatchFailure(op, "Failed to expand to batch");
+      }
+    }
+
+    int64_t groups = op.getGroups();
+    input = op.getInput();
+    inputType = cast<ShapedType>(input.getType());
+    int64_t iC = inputType.getDimSize(1);
+    int64_t C = CEIL_DIV(iC, C0 * groups) * (C0 * groups);
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "start insert [pad expand trans] op for conv1D op"
+               << "\n");
+    if (failed(
+            insertPadExpandTransToFormatInput(op, rewriter, C0, C, groups))) {
+      return rewriter.notifyMatchFailure(
+          op, "Failed to insert pad/expand/trans for input");
+    }
+    if (failed(
+            insertPadExpandTransToFormatWeight(op, rewriter, C0, groups, C))) {
+      return rewriter.notifyMatchFailure(
+          op, "Failed to insert pad/expand/trans for weight");
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "insert op for conv1D op successfully!"
+                            << "\n");
+    return success();
+  }
+};
+
+struct NormalizeConvOpsPass
+    : public impl::NormalizeConvOpsBase<NormalizeConvOpsPass> {
+  using Base::Base;
+  void runOnOperation() override;
+};
+
+/// This pattern transforms bf16/fp16 output of Conv1dL1 to fp32
+/// and then cast back
+template <typename TargetType>
+struct NormalizeConvResultTypePattern
+    : public OpRewritePattern<hivm::Conv1DL1Op> {
+public:
+  using OpRewritePattern<hivm::Conv1DL1Op>::OpRewritePattern;
+  ~NormalizeConvResultTypePattern() override = default;
+
+  LogicalResult matchAndRewrite(hivm::Conv1DL1Op op,
+                                PatternRewriter &rewriter) const override {
+    
+    if (!op.hasPureTensorSemantics()) {
+      return failure();
+    }
+
+    auto resultType =
+        dyn_cast<RankedTensorType>(op.getResultTensors()[0].getType());
+    if (!resultType)
+      return failure();
+
+    auto elemType = resultType.getElementType();
+    if (!isa<TargetType>(elemType)) {
+      return failure();
+    }
+
+    Location loc = op.getLoc();
+    auto fp32Ty = rewriter.getF32Type();
+
+    Value bias = op.getBias();
+    Value newBias = bias;
+
+    if (bias && elemType.isBF16()) {
+      auto biasType = mlir::cast<RankedTensorType>(bias.getType());
+      auto biasShape = biasType.getShape();
+      auto biasElemType = biasType.getElementType();
+
+      auto biasCastType = RankedTensorType::get(biasShape, fp32Ty);
+      auto biasCastInit = 
+          rewriter.create<tensor::EmptyOp>(loc, biasShape, fp32Ty);
+      auto biasRoundAttr = getRoundAttr(rewriter, biasElemType, fp32Ty);
+
+      newBias = rewriter
+                    .create<hivm::VCastOp>(
+                        loc, TypeRange{biasCastType}, ValueRange{bias},
+                        ValueRange{biasCastInit.getResult()}, Value(),
+                        biasRoundAttr, hivm::TypeFnAttr{})
+                    ->getResult(0);
+    }
+
+    SmallVector<int64_t> shape(resultType.getShape().begin(),
+                               resultType.getShape().end());
+
+    auto fp32ResultType = RankedTensorType::get(shape, fp32Ty);
+    auto init = rewriter.create<tensor::EmptyOp>(loc, shape, fp32Ty);
+
+    auto input = op.getInput();
+    auto weight = op.getWeight();
+    auto initCondition = op.getInitCondition();
+    auto padding = op.getPaddingAttr();
+    auto groups = op.getGroupsAttr();
+
+    auto newConv =
+        rewriter.create<hivm::Conv1DL1Op>(loc, TypeRange{fp32ResultType},
+                                          input,         // input
+                                          weight,        // weight
+                                          newBias,       // bias
+                                          init,          // init
+                                          initCondition, // init_condition
+                                          ValueRange{},  // sync_related_args
+                                          padding,       // padding
+                                          groups         // groups
+        );
+
+    auto castInit = rewriter.create<tensor::EmptyOp>(loc, shape, elemType);
+    auto roundAttr = getRoundAttr(rewriter, fp32Ty, elemType);
+
+    auto castResult =
+        rewriter
+            .create<hivm::VCastOp>(loc, TypeRange{castInit.getType()},
+                                   ValueRange{newConv.getResultTensors()[0]},
+                                   ValueRange{castInit.getResult()},
+                                   /*temp_buffer=*/Value(), roundAttr,
+                                   hivm::TypeFnAttr{})
+            ->getResult(0);
+
+    rewriter.replaceOp(op, castResult);
+
+    return success();
+  }
+};
+
+/// This pattern decomposes Conv1dL1 with bias into Conv1dL1(no bias) + vadd.
+/// Vadd is inserted to different position (after Conv1dL1 + vcast or directly
+/// after Conv1dL1) according to different dtype
+template <typename TargetType> 
+struct DecomposeConv1dWithBiasPattern
+    : public OpRewritePattern<hivm::Conv1DL1Op> {
+public:
+  using OpRewritePattern<hivm::Conv1DL1Op>::OpRewritePattern;
+  ~DecomposeConv1dWithBiasPattern() override = default;
+
+  LogicalResult matchAndRewrite(hivm::Conv1DL1Op op,
+                                PatternRewriter &rewriter) const override {
+
+    if (!op.hasPureTensorSemantics()) {
+      return failure();
+    }
+
+    Value bias = op.getBias();
+    if (!bias)
+      return failure();
+
+    auto biasType = dyn_cast<RankedTensorType>(bias.getType());
+    if (!biasType) {
+      return failure();
+    }
+
+    auto biasElemType = biasType.getElementType();
+    if (!isa<TargetType>(biasElemType)) {
+      return failure();
+    }
+
+    auto resultType =
+        dyn_cast<RankedTensorType>(op.getResultTensors()[0].getType());
+    if (!resultType)
+      return failure();
+
+    int64_t rank = resultType.getRank();
+    if (rank != 2 && rank != 3)
+      return failure();
+
+    Location loc = op.getLoc();
+
+    auto input = op.getInput();
+    auto weight = op.getWeight();
+    auto initCondition = op.getInitCondition();
+    auto padding = op.getPaddingAttr();
+    auto groups = op.getGroupsAttr();
+
+    auto elemType = resultType.getElementType();
+    SmallVector<int64_t> shape(resultType.getShape().begin(),
+                               resultType.getShape().end());
+
+    auto convNoBiasInit =
+        rewriter.create<tensor::EmptyOp>(loc, shape, elemType);
+
+    auto newConv =
+        rewriter.create<hivm::Conv1DL1Op>(loc, TypeRange{resultType},
+                                          input,              // input
+                                          weight,             // weight
+                                          /* bias */ Value(), // remove bias
+                                          convNoBiasInit,     // init
+                                          initCondition,      // init_condition
+                                          ValueRange{}, // sync_related_args
+                                          padding,      // padding
+                                          groups        // groups
+        );
+
+    Value convResult = newConv.getResultTensors()[0];
+
+    int64_t oC =
+        (rank == 2) ? resultType.getDimSize(0) : resultType.getDimSize(1);
+
+    SmallVector<int64_t> expandedShape;
+    SmallVector<SmallVector<int64_t, 2>> reassoc;
+
+    if (rank == 2) {
+      expandedShape = {oC, 1};
+      reassoc = {{0, 1}};
+    } else {
+      expandedShape = {1, oC, 1};
+      reassoc = {{0, 1, 2}};
+    }
+
+    auto expandedType = RankedTensorType::get(expandedShape, biasElemType);
+    auto expandedBias = rewriter.create<tensor::ExpandShapeOp>(
+        loc, expandedType, bias, reassoc);
+
+    auto convResultElemType = 
+        dyn_cast<RankedTensorType>(convResult.getType()).getElementType();
+    
+    if (convResultElemType != biasElemType) {
+      return rewriter.notifyMatchFailure(
+          op, "bias type mismatch with convResult type");
+    }
+
+    SmallVector<int64_t> broadcastDims;
+    if (rank == 2)
+      broadcastDims = {1};
+    else
+      broadcastDims = {0, 2};
+
+    auto broadcastAttr = rewriter.getDenseI64ArrayAttr(broadcastDims);
+
+    auto vaddInit = 
+        rewriter.create<tensor::EmptyOp>(loc, shape, convResultElemType);
+    
+    auto vadd = rewriter.create<hivm::VAddOp>(
+        loc, TypeRange{vaddInit.getType()},
+        ValueRange{convResult, expandedBias}, ValueRange{vaddInit}, Value(),
+        nullptr, broadcastAttr);
+
+    rewriter.replaceOp(op, vadd->getResult(0));
+
+    return success();
+  }
+};
+
+/// This pattern normalizes the output layout of hivm::Conv1DL1Op by fusing
+/// batch and group dimensions and aligning width and per-group channels,
+/// then restoring the result back to the user-visible layout.
+///
+/// Motivation:
+///   The original Conv1DL1 produces output in logical layout:
+///     - without batch: [oC, oW]
+///     - with batch:    [B, oC, oW]
+///   For hardware execution, batch and group are fused together, and the
+///   output layout is required to be aligned:
+///     - oW aligned to FRACTAL_BLOCK_NUM
+///     - oCPerGroup aligned to FRACTAL_BLOCK_NUM
+///
+/// Rewrite overview:
+///   1. Rewrite Conv1DL1 to produce a fused & aligned layout:
+///        [oWCeil, fusedOCCeil]
+///      where:
+///        - fusedOC     = B * oC
+///        - fusedOCCeil = B * ceil(oC / groups, FRACTAL_BLOCK_NUM) * groups
+///        - oWCeil      = ceil(oW, FRACTAL_BLOCK_NUM)
+///
+///   2. Post-process the aligned layout:
+///      - Slice away padding on width and channels.
+///      - Transpose the result to get [fusedOC, oW].
+///      - For grouped and unaligned channels, remove per-group padding by
+///        per-group slice + insert.
+///
+///   3. Restore user-visible layout if batch exists:
+///        [fusedOC, oW] -> [B, oC, oW]
+///
+/// Semantics:
+///   out[(n), c, w] = conv1d(input, weight, bias)[(n), c, w]
+///   This pattern only changes the physical layout for alignment and
+///   hardware execution, and then restores the logical layout expected by
+///   users. The numerical semantics are unchanged.
+///
+/// In short:
+///   user layout
+///     -> fused & aligned layout (for hardware)
+///     -> sliced / transposed / reshaped back to user layout
+struct NormalizeConvOutputPattern : public OpRewritePattern<hivm::Conv1DL1Op> {
+public:
+  using OpRewritePattern<hivm::Conv1DL1Op>::OpRewritePattern;
+  ~NormalizeConvOutputPattern() override = default;
+
+  LogicalResult matchAndRewrite(hivm::Conv1DL1Op op,
+                                PatternRewriter &rewriter) const override {
+    
+    if (op->getAttr(outputAlreadyNormalized)) {
+      return failure();
+    }
+
+    auto input = op.getInput();
+    auto weight = op.getWeight();
+    auto bias = op.getBias();
+    auto init = op.getInit();
+    auto initCondition = op.getInitCondition();
+    auto padding = op.getPaddingAttr();
+    auto groups = op.getGroupsAttr();
+    int64_t groupsVal = groups.getInt();
+
+    auto convResult = op.getResultTensors()[0];
+    auto resultType = dyn_cast<RankedTensorType>(convResult.getType());
+    if (!resultType || (resultType.getRank() != 2 && resultType.getRank() != 3)) {
+      return failure();
+    }
+
+    auto initType = dyn_cast<RankedTensorType>(init.getType());
+    if (!initType || (initType.getRank() != 2 && initType.getRank() != 3)) {
+      return failure();
+    }
+
+    bool hasBatch = resultType.getRank() == 3;
+
+    int64_t batch = 1;
+    int64_t oC, oW;
+
+    if (!hasBatch) {
+      // [oC, oW]
+      oC = resultType.getDimSize(0);
+      oW = resultType.getDimSize(1);
+    } else {
+      // [B, oC, oW]
+      batch = resultType.getDimSize(0);
+      oC = resultType.getDimSize(1);
+      oW = resultType.getDimSize(2);
+    }
+
+    int64_t oCPerGroup = oC / groupsVal;
+    int64_t oCPerGroupCeil = CEIL_FACTOR(oCPerGroup, utils::FRACTAL_BLOCK_NUM);
+    int64_t oCCeil = oCPerGroupCeil * groupsVal;
+
+    bool isOCPerGroupAligned = (oCPerGroup % utils::FRACTAL_BLOCK_NUM == 0);
+    int64_t oWCeil = CEIL_FACTOR(oW, utils::FRACTAL_BLOCK_NUM);
+    int64_t fusedOC = batch * oC;
+    int64_t fusedOCCeil = batch * oCCeil;
+    int64_t fusedGroupsVal = batch * groupsVal;
+
+    auto elementType = resultType.getElementType();
+    Location loc = op.getLoc();
+
+    SmallVector<int64_t> newShape{oWCeil, fusedOCCeil};
+    auto newResultType = RankedTensorType::get(newShape, elementType);
+    Value newEmpty =
+ 	      rewriter.create<tensor::EmptyOp>(loc, newShape, elementType);
+
+    // === create new ConvOp with result of new shape ===
+    auto newConvOp = rewriter.create<hivm::Conv1DL1Op>(
+        loc,           // location
+        newResultType, // result type: [oWCeil, fusedOCCeil]
+        input,         // input
+        weight,        // weight
+        bias,          // bias
+        newEmpty,      // init: [oWCeil, fusedOCCeil]
+        initCondition, // init condition
+        ValueRange{},  // sync_related_args
+        padding,       // padding attribute
+        groups         // groups attribute
+    );
+
+    Value newResult = newConvOp.getResultTensors()[0];
+
+    // === rewrite vcast and update target if exist ===
+    Value target = convResult;
+    Value newTarget = newResult;
+    hivm::VCastOp castOp = nullptr;
+
+    if (convResult.hasOneUse()) {
+      castOp = dyn_cast<hivm::VCastOp>(*convResult.user_begin());
+    }
+
+    if (castOp) {
+      auto castResultType = 
+          mlir::cast<RankedTensorType>(castOp->getResult(0).getType());
+      auto newCastResultType =
+          RankedTensorType::get(newShape, castResultType.getElementType());
+      auto newCastInit = rewriter.create<tensor::EmptyOp>(
+          loc, newShape, castResultType.getElementType());
+      
+      auto newCastOp = rewriter.create<hivm::VCastOp>(
+          loc, TypeRange{newCastResultType}, ValueRange{newResult},
+          ValueRange{newCastInit.getResult()}, /*temp_buffer=*/Value(),
+          castOp.getRoundModeAttr(), hivm::TypeFnAttr{});
+      
+      target = castOp->getResult(0);
+      newTarget = newCastOp->getResult(0);
+    }
+
+    auto newTargetType =
+        mlir::cast<RankedTensorType>(newTarget.getType()).getElementType();
+    
+    // === post process to [fusedOC, oW] ===
+    if (isOCPerGroupAligned || fusedGroupsVal == 1) {
+ 	    // case: aligned or fusedGroupsVal == 1
+      // step 1: [oWCeil, fusedOCCeil] -> [oW, fusedOC]
+      SmallVector<OpFoldResult, 2> offsets{
+          rewriter.getIndexAttr(0),
+          rewriter.getIndexAttr(0),
+      };
+
+      SmallVector<OpFoldResult, 2> sizes{
+          rewriter.getIndexAttr(oW),
+          rewriter.getIndexAttr(fusedOC),
+      };
+
+      SmallVector<OpFoldResult, 2> strides{
+          rewriter.getIndexAttr(1),
+          rewriter.getIndexAttr(1),
+      };
+ 	 
+ 	    auto sliceType = RankedTensorType::get({oW, fusedOC}, newTargetType);
+      auto slice = rewriter.create<tensor::ExtractSliceOp>(
+          loc, sliceType, newTarget, offsets, sizes, strides);
+ 	 
+ 	    // step 2: transpose [oW, fusedOC] -> [fusedOC, oW]
+      SmallVector<int64_t> tShape{fusedOC, oW};
+      Value tInit =
+          rewriter.create<tensor::EmptyOp>(loc, tShape, newTargetType);
+      SmallVector<int64_t, 2> perm{1, 0};
+
+      newResult = rewriter
+                      .create<hivm::VTransposeOp>(
+                          loc, TypeRange{tInit.getType()}, slice, tInit,
+                          rewriter.getDenseI64ArrayAttr(perm))
+                      ->getResult(0);
+    } else {
+      // case: not aligned && fusedGroupsVal != 1
+      // step 1: transpose [oWCeil, fusedOCCeil] -> [fusedOCCeil, oWCeil]
+      SmallVector<int64_t> tShape{fusedOCCeil, oWCeil};
+      Value tInit =
+          rewriter.create<tensor::EmptyOp>(loc, tShape, newTargetType);
+      SmallVector<int64_t, 2> perm{1, 0};
+
+      Value transposedOutput =
+          rewriter
+              .create<hivm::VTransposeOp>(loc, TypeRange{tInit.getType()},
+                                          newTarget, tInit,
+                                          rewriter.getDenseI64ArrayAttr(perm))
+              ->getResult(0);
+    
+      // step 2: alloc [fusedOC, oWCeil]
+      SmallVector<int64_t> sShape{fusedOC, oWCeil};
+      Value slicedOutput =
+          rewriter.create<tensor::EmptyOp>(loc, sShape, newTargetType);
+
+      // step 3: for i in [0, fusedGroupsVal), extract_slice + insert_slice
+      auto zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      auto upper = rewriter.create<arith::ConstantIndexOp>(loc, fusedGroupsVal);
+      auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+      auto forOp = rewriter.create<scf::ForOp>(loc, zero, upper, step,
+                                               ValueRange{slicedOutput});
+
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(forOp.getBody());
+
+        Value iv = forOp.getInductionVar();
+        Value slicedOutput = forOp.getRegionIterArg(0);
+
+        auto oCPerGroupCeilVal =
+            rewriter.create<arith::ConstantIndexOp>(loc, oCPerGroupCeil);
+        auto oCPerGroupVal =
+            rewriter.create<arith::ConstantIndexOp>(loc, oCPerGroup);
+
+        Value srcOffset0 =
+            rewriter.create<arith::MulIOp>(loc, iv, oCPerGroupCeilVal);
+        Value dstOffset0 =
+            rewriter.create<arith::MulIOp>(loc, iv, oCPerGroupVal);
+
+        // subTransposedOutput = extract_slice transposedOutput 
+        // [oCPerGroup, oWCeil]
+        SmallVector<OpFoldResult, 2> srcOffsets{srcOffset0,
+                                                rewriter.getIndexAttr(0)};
+        SmallVector<OpFoldResult, 2> srcSizes{rewriter.getIndexAttr(oCPerGroup),
+                                              rewriter.getIndexAttr(oWCeil)};
+        SmallVector<OpFoldResult, 2> srcStrides{rewriter.getIndexAttr(1),
+                                                rewriter.getIndexAttr(1)};
+
+        auto subTransposedOutput = rewriter.create<tensor::ExtractSliceOp>(
+            loc, transposedOutput, srcOffsets, srcSizes, srcStrides);
+
+        // newSlicedOutput = insert_slice subTransposedOutput into slicedOutput
+        SmallVector<OpFoldResult, 2> dstOffsets{dstOffset0,
+                                                rewriter.getIndexAttr(0)};
+        SmallVector<OpFoldResult, 2> dstSizes{rewriter.getIndexAttr(oCPerGroup),
+                                              rewriter.getIndexAttr(oWCeil)};
+        SmallVector<OpFoldResult, 2> dstStrides{rewriter.getIndexAttr(1),
+                                                rewriter.getIndexAttr(1)};
+
+        auto newSlicedOutput = rewriter.create<tensor::InsertSliceOp>(
+            loc, subTransposedOutput.getResult(), slicedOutput, dstOffsets,
+            dstSizes, dstStrides);
+
+        rewriter.create<scf::YieldOp>(loc, newSlicedOutput.getResult());
+      }
+
+      Value slicedResult = forOp.getResult(0);
+
+      // step 4: extract_slice slicedResult: [fusedOC, oWCeil] -> [fusedOC, oW]
+      SmallVector<OpFoldResult, 2> offsets{
+          rewriter.getIndexAttr(0),
+          rewriter.getIndexAttr(0),
+      };
+      SmallVector<OpFoldResult, 2> sizes{
+          rewriter.getIndexAttr(fusedOC),
+          rewriter.getIndexAttr(oW),
+      };
+      SmallVector<OpFoldResult, 2> strides{
+          rewriter.getIndexAttr(1),
+          rewriter.getIndexAttr(1),
+      };
+
+      auto finalType = RankedTensorType::get({fusedOC, oW}, newTargetType);
+      auto extractSliceOp = rewriter.create<tensor::ExtractSliceOp>(
+          loc, finalType, slicedResult, offsets, sizes, strides);
+
+      newResult = extractSliceOp.getResult();
+    }
+
+    // === batch reshape ===
+    if (hasBatch) {
+      auto finalType = RankedTensorType::get({batch, oC, oW}, newTargetType);
+
+      SmallVector<ReassociationIndices> reassoc = {
+          {0, 1}, // B * oC
+          {2}     // oW
+      };
+
+      newResult = rewriter.create<tensor::ExpandShapeOp>(loc, finalType,
+                                                         newResult, reassoc);
+    }
+ 	 
+    rewriter.replaceOp(target.getDefiningOp(), newResult);
+    newConvOp->setAttr(outputAlreadyNormalized, rewriter.getUnitAttr());
+    return success();
+  }
+};
+
+void populateNormalizeConvOpsPattern1(RewritePatternSet &patterns) {
+  patterns.add<NormalizeConvResultTypePattern<BFloat16Type>>(
+      patterns.getContext());
+  patterns.add<DecomposeConv1dWithBiasPattern<Float16Type>>(
+      patterns.getContext());
+}
+
+void populateNormalizeConvOpsPattern2(RewritePatternSet &patterns) {
+  patterns.add<NormalizeConvResultTypePattern<Float16Type>>(
+      patterns.getContext());
+  patterns.add<DecomposeConv1dWithBiasPattern<Float32Type>>(
+      patterns.getContext());
+}
+
+void populateNormalizeConvOpsPattern3(RewritePatternSet &patterns) {
+  patterns.add<NormalizeConvInputAndWeightPattern>(patterns.getContext());
+  patterns.add<NormalizeConvOutputPattern>(patterns.getContext());
+}
+
+void NormalizeConvOpsPass::runOnOperation() {
+  OpBuilder builder(&getContext());
+  auto *context = &getContext();
+  auto *funcOp = getOperation();
+
+  // First Round
+  RewritePatternSet patterns1(context);
+  populateNormalizeConvOpsPattern1(patterns1);
+  GreedyRewriteConfig config1 = GreedyRewriteConfig();
+  (void)applyPatternsGreedily(funcOp, std::move(patterns1), config1);
+
+  // Second Round
+  RewritePatternSet patterns2(context);
+  populateNormalizeConvOpsPattern2(patterns2);
+  GreedyRewriteConfig config2 = GreedyRewriteConfig();
+  (void)applyPatternsGreedily(funcOp, std::move(patterns2), config2);
+
+  // Third Round
+  RewritePatternSet patterns3(context);
+  populateNormalizeConvOpsPattern3(patterns3);
+  GreedyRewriteConfig config3 = GreedyRewriteConfig();
+  (void)applyPatternsGreedily(funcOp, std::move(patterns3), config3);
+}
+
+} // namespace
+
+std::unique_ptr<Pass> mlir::hivm::createNormalizeConvOpsPass() {
+  return std::make_unique<NormalizeConvOpsPass>();
+}

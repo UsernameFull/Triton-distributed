@@ -1,0 +1,4 @@
+url=https://github.com/llvm/llvm-project.git
+sha=fad3272286528b8a491085183434c5ad4b59ab92
+vendored=2026-09-12T12:40:14Z
+note=fad3272.patch PRE-APPLIED; trimmed to llvm+mlir+lld, no tests; build with -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF

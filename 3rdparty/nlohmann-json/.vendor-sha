@@ -1,0 +1,4 @@
+url=https://github.com/nlohmann/json/releases/download/v3.11.3/include.zip
+sha=v3.11.3
+vendored=2026-09-12T12:40:30Z
+note=release include.zip; JSON_SYSPATH for TRITON_OFFLINE_BUILD

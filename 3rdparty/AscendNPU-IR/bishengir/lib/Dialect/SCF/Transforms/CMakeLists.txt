@@ -1,0 +1,18 @@
+add_bishengir_dialect_library(BiShengIRSCFTransforms
+  CanonicalizeIterArg.cpp
+  MapForToForall.cpp
+  RemoveRedundantLoopInit.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${MLIR_MAIN_INCLUDE_DIR}/bishengir/Dialect/SCF/Transforms
+
+  DEPENDS
+  BiShengIRSCFTransformsIncGen
+
+  LINK_LIBS PUBLIC
+  BiShengIRSCFUtils
+  MLIRSCFDialect
+  MLIRIR
+  MLIRDialect
+  MLIRPass
+)

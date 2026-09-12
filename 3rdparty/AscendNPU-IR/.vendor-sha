@@ -1,0 +1,4 @@
+url=https://gitcode.com/Ascend/AscendNPU-IR.git
+sha=1b33649151424798b95187fb5fc4824f982607e4
+vendored=2026-09-12T12:36:55Z
+note=bishengir patches PRE-APPLIED to third-party/llvm-project; build WITHOUT --apply-patches; torch-mlir intentionally absent

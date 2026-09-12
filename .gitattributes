@@ -1,0 +1,6 @@
+# Shell scripts and patches must stay LF everywhere: a CRLF working-tree copy
+# breaks bash (`bad interpreter`) and `git apply` ("corrupt patch") as soon as
+# it reaches a Linux build host. Vendored trees have their own
+# 3rdparty/.gitattributes with the same intent.
+*.sh text eol=lf
+*.patch text eol=lf

@@ -1,0 +1,4 @@
+  --install-path=<path>             Install to specifiv path
+  --install                         Install run mode
+  --uninstall                       Uninstall run mode
+  --install-for-all                 Install for all users

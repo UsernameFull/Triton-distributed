@@ -1,0 +1,59 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+*.bin
+
+/.idea/
+/.vscode/
+/cmake-build-*/
+/build/
+/Build/
+/install/
+
+sync_config.jsonc
+/tests/examples/matmul_allreduce/__pycache__
+*__pycache__*
+
+3rdparty/
+install/
+oat_reports/
+log/
+
+# compile temp file
+ci/
+dist/
+package/
+src/python/shmem.egg-info/
+src/python/shmem/VERSION
+
+.arts/

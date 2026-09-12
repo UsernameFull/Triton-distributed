@@ -1,0 +1,4 @@
+url=https://github.com/llvm/llvm-project.git
+sha=cd708029e0b2869e80abe31ddb175f7c35361f90
+vendored=2026-09-12T12:36:55Z
+note=npuir build-tools/patches/llvm-project/*.patch pre-applied; trimmed to llvm+mlir+lld, no tests

@@ -1,0 +1,4 @@
+# Keep vendored sources and patches byte-identical on every platform:
+# normalize to LF in the repo AND in working trees (a CRLF checkout of
+# 3rdparty/*.patch makes `git apply` fail with "corrupt patch").
+* text=auto eol=lf

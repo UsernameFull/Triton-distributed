@@ -1,0 +1,4 @@
+url=https://github.com/triton-lang/triton-ascend.git
+sha=bfd8f55d124f0da70ef792cb8d9f759d7302bb26
+vendored=2026-09-12T12:21:57Z
+note=pristine; 3rdparty/triton-ascend.patch applied by setup.py at build time
