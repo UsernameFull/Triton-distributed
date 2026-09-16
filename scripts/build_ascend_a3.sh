@@ -232,7 +232,8 @@ else
     # The vendored tree carries triton-ascend's llvm patch pre-applied and has
     # its test suites trimmed, hence *_INCLUDE_TESTS=OFF (FileCheck is gated by
     # LLVM_INCLUDE_UTILS and is still built; llvm-lit is not built and nothing
-    # in this flow needs it).
+    # in this flow needs it). third-party/benchmark (google/benchmark
+    # submodule) was never vendored, hence INCLUDE_BENCHMARKS=OFF.
     cmake -S "$REPO_DIR/3rdparty/llvm-project/llvm" -B "$LLVM_BUILD_DIR" -G Ninja \
         -DCMAKE_C_COMPILER="$CLANG_BIN" \
         -DCMAKE_CXX_COMPILER="$CLANGXX_BIN" \
@@ -252,6 +253,7 @@ else
         -DLLVM_VERSION_PATCH=0 \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DMLIR_INCLUDE_TESTS=OFF \
+        -DLLVM_INCLUDE_BENCHMARKS=OFF \
         -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL_PREFIX"
     ninja -C "$LLVM_BUILD_DIR" -j "$JOBS" install
     cp "$LLVM_BUILD_DIR/bin/FileCheck" "$LLVM_INSTALL_PREFIX/bin/FileCheck"
@@ -283,9 +285,11 @@ else
     #     third-party/torch-mlir which we intentionally do not vendor)
     #   * no -t (check-mlir/check-bishengir lit suites need the trimmed test
     #     trees; plain `ninja` builds a superset of the required binaries)
+    #   * *_INCLUDE_TESTS=OFF + INCLUDE_BENCHMARKS=OFF via --add-cmake-options
+    #     (test suites and third-party/benchmark were trimmed from the tree)
     bash ./build-tools/build.sh -o ./build -j "$JOBS" --build-type Release \
         --bisheng-compile="$ASCEND_HOME_PATH/bin" --build-shmem-template \
-        --add-cmake-options="-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF"
+        --add-cmake-options="-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF"
     echo "$NPU_SHA" > "$WORK_ROOT/.stamp_npu_ir"
 fi
 export PATH="$NPU_IR_DIR/build/bin:$PATH"
