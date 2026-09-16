@@ -242,6 +242,14 @@ else
         -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld" \
         -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU" \
         -DLLVM_ENABLE_LLD=ON \
+        # Pin the LLVM version explicitly: a stale CMakeCache.txt can otherwise
+        # carry these as DEFINED-but-empty, which makes project(VERSION ..)
+        # fail with `VERSION ".." format invalid` at llvm/CMakeLists.txt:46.
+        # Values match the vendored tree's own cmake/Modules/LLVMVersion.cmake
+        # defaults (fad3272); command-line -D always wins over the cache.
+        -DLLVM_VERSION_MAJOR=22 \
+        -DLLVM_VERSION_MINOR=0 \
+        -DLLVM_VERSION_PATCH=0 \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DMLIR_INCLUDE_TESTS=OFF \
         -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL_PREFIX"
