@@ -21,8 +21,9 @@
 #   llvm-project/     llvm/llvm-project @ fad3272 (the commit recorded in
 #                     triton-ascend's cmake/llvm-hash.txt) with triton-ascend's
 #                     third_party/ascend/llvm_patch/fad3272.patch PRE-APPLIED.
-#                     Trimmed to llvm/ + mlir/ + lld/ (the subprojects the build
-#                     uses, LLVM_ENABLE_PROJECTS="mlir;llvm;lld"); test suites
+#                     Trimmed to llvm/ + mlir/ + lld/ (+ monorepo-root cmake/,
+#                     which llvm/CMakeLists.txt needs for CMakePolicy.cmake,
+#                     LLVMVersion.cmake and Modules/); test suites
 #                     removed (built with -DLLVM_INCLUDE_TESTS=OFF
 #                     -DMLIR_INCLUDE_TESTS=OFF, which keeps FileCheck -- it is
 #                     gated by LLVM_INCLUDE_UTILS -- and drops only llvm-lit,
@@ -182,7 +183,7 @@ apply_exec_bits() {  # $1=list file $2=prefix under $ROOT (files must already be
     rm -f "$filtered"
 }
 
-trim_llvm_tree() {  # $1=llvm-project root; keep llvm+mlir+lld, drop test suites
+trim_llvm_tree() {  # $1=llvm-project root; keep llvm+mlir+lld+cmake, drop test suites
     local root="$1" e base l
     # Drop git-declared symlinks FIRST (while .git still exists): on Windows
     # they are materialized as fake regular files, so `find -type l` cannot
@@ -195,7 +196,11 @@ trim_llvm_tree() {  # $1=llvm-project root; keep llvm+mlir+lld, drop test suites
             rm -f "$root/$l"
         done < <(git -C "$root" ls-files -s | awk -F'\t' '$1 ~ /^120000/ {print $2}')
     fi
-    local keep=" llvm mlir lld LICENSE.TXT README.md "
+    # llvm/CMakeLists.txt sources CMakePolicy.cmake, LLVMVersion.cmake and the
+    # whole Modules/ dir from the monorepo-root cmake/ (lines 6-20 + later
+    # CMAKE_MODULE_PATH insert), so it must be kept even though we never
+    # build clang/ & co.
+    local keep=" llvm mlir lld cmake LICENSE.TXT README.md "
     shopt -s dotglob
     for e in "$root"/*; do
         base="$(basename "$e")"
@@ -400,10 +405,10 @@ access** at build time. Each tree carries a \`.vendor-sha\` provenance file.
 
 | Path | Upstream | Commit / Version | State |
 |---|---|---|
-| \`llvm-project/\` | github.com/llvm/llvm-project | \`$LLVM_SHA\` | triton-ascend \`llvm_patch/$(basename "$LLVM_PATCH")\` **pre-applied**; trimmed to \`llvm/+mlir/+lld\`, test suites removed (build with \`-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF\`; FileCheck is kept, llvm-lit is not built and not needed) |
+| \`llvm-project/\` | github.com/llvm/llvm-project | \`$LLVM_SHA\` | triton-ascend \`llvm_patch/$(basename "$LLVM_PATCH")\` **pre-applied**; trimmed to \`llvm/+mlir/+lld\` (+ monorepo-root \`cmake/\`, required by \`llvm/CMakeLists.txt\`), test suites removed (build with \`-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF\`; FileCheck is kept, llvm-lit is not built and not needed) |
 | \`triton-ascend/\` | github.com/triton-lang/triton-ascend | \`$TA_SHA\` | pristine (submodule pin; \`3rdparty/triton-ascend.patch\` applies -- verified by vendor_deps.sh and build-step preflight; setup.py applies it at build time) |
 | \`triton-ascend/third_party/ascend/AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | pristine (triton-ascend's pin; setup.py applies \`3rdparty/AscendNPU-IR.patch\`; TA cmake builds it with \`BISHENGIR_BUILD_STANDALONE_IR_ONLY=ON\`, its \`third-party/\` is not needed) |
-| \`AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | standalone bisheng tool build (build-step 3); its \`third-party/llvm-project\` @ \`$NPU_LLVM_SHA\` has npuir's own \`build-tools/patches/llvm-project/*.patch\` **pre-applied** and is trimmed like above; \`third-party/torch-mlir\` intentionally absent (\`BUILD_TORCH_MLIR=OFF\`) |
+| \`AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | standalone bisheng tool build (build-step 3); its \`third-party/llvm-project\` @ \`$NPU_LLVM_SHA\` has npuir's own \`build-tools/patches/llvm-project/*.patch\` **pre-applied** and is trimmed like above (incl. root \`cmake/\`); \`third-party/torch-mlir\` intentionally absent (\`BUILD_TORCH_MLIR=OFF\`) |
 | \`shmem/\` | gitcode.com/cann/shmem | \`$SHMEM_SHA\` | pristine (submodule pin; the \`-python_extension\` path of its \`scripts/build.sh\` performs no downloads -- catlass/googletest/json are only fetched by -uttests/-examples/-python_example/-full/SOC_TYPE=Ascend950) |
 | \`nlohmann-json/\` | github.com/nlohmann/json release | v$JSON_VERSION | \`include/\` + \`single_include/\`; passed to setup.py via \`JSON_SYSPATH\` under \`TRITON_OFFLINE_BUILD=1\` |
 
@@ -416,7 +421,9 @@ Notes:
 * \`3rdparty/.gitattributes\` forces LF everywhere so a Windows checkout can
   never corrupt the vendored trees or \`3rdparty/*.patch\`.
 * The two LLVM trees are trimmed: clang/lldb/flang/libcxx/... and all
-  \`test/\`+\`unittests/\` directories are absent. This is safe because the
+  \`test/\`+\`unittests/\` directories are absent, but the monorepo-root \`cmake/\`
+  is kept (\`llvm/CMakeLists.txt\` sources \`CMakePolicy.cmake\`,
+  \`LLVMVersion.cmake\` and \`Modules/\` from it). This is safe because the
   builds only enable \`mlir;llvm;lld\` (resp. \`mlir\`) and pass
   \`*_INCLUDE_TESTS=OFF\`; FileCheck lives under \`llvm/utils\` (gated by
   \`LLVM_INCLUDE_UTILS\`, default ON) and is still built+installed. The
