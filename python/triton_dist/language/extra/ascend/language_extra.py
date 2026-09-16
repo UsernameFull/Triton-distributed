@@ -218,7 +218,10 @@ def unpack(src, dst_type, _semantic=None):
         elem = tl.cast(masked, dst_int_ty, _semantic=_semantic)
         elem = tl.cast(elem, dst_type, bitcast=True, _semantic=_semantic)
         results.append(elem)
-    return results
+    # Return a tuple (not a list): the Ascend code generator turns tuple
+    # returns from builtins into language.tuple, whereas a bare list would be
+    # passed to semantic.to_tensor and rejected.
+    return tuple(results)
 
 
 __all__ = [
