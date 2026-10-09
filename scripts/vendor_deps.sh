@@ -23,11 +23,13 @@
 #                     third_party/ascend/llvm_patch/fad3272.patch PRE-APPLIED.
 #                     Trimmed to llvm/ + mlir/ + lld/ (+ monorepo-root cmake/,
 #                     which llvm/CMakeLists.txt needs for CMakePolicy.cmake,
-#                     LLVMVersion.cmake and Modules/); test suites
-#                     removed (built with -DLLVM_INCLUDE_TESTS=OFF
-#                     -DMLIR_INCLUDE_TESTS=OFF, which keeps FileCheck -- it is
-#                     gated by LLVM_INCLUDE_UTILS -- and drops only llvm-lit,
-#                     which nothing in this flow consumes).
+#                     LLVMVersion.cmake and Modules/, + third-party/siphash/
+#                     alone -- header-only SipHash.h that llvm/lib/Support/
+#                     SipHash.cpp includes); test suites removed (built with
+#                     -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF, which
+#                     keeps FileCheck -- it is gated by LLVM_INCLUDE_UTILS --
+#                     and drops only llvm-lit, which nothing in this flow
+#                     consumes).
 #   triton-ascend/    triton-lang/triton-ascend @ the submodule-pinned commit
 #                     (bfd8f55), PRISTINE: python/setup.py git-applies
 #                     3rdparty/triton-ascend.patch at build time (verified by
@@ -200,13 +202,31 @@ trim_llvm_tree() {  # $1=llvm-project root; keep llvm+mlir+lld+cmake, drop test 
     # whole Modules/ dir from the monorepo-root cmake/ (lines 6-20 + later
     # CMAKE_MODULE_PATH insert), so it must be kept even though we never
     # build clang/ & co.
-    local keep=" llvm mlir lld cmake LICENSE.TXT README.md "
+    # third-party/ must survive the trim: llvm/lib/Support/SipHash.cpp does
+    #   #include "siphash/SipHash.h"
+    # and llvm/lib/Support/CMakeLists.txt puts ${LLVM_THIRD_PARTY_DIR}/siphash/
+    # include on LLVMSupport include path. LLVM_THIRD_PARTY_DIR is
+    # ${CMAKE_CURRENT_SOURCE_DIR}/../third-party, and since CMake include()
+    # leaves CMAKE_CURRENT_SOURCE_DIR alone (verified: it stays <root>/llvm,
+    # the dir of llvm/CMakeLists.txt) that is exactly <root>/third-party.
+    # Dropping the whole dir is what made the build die with
+    #   llvm/lib/Support/SipHash.cpp:15:10: error: 'siphash/SipHash.h' file not found
+    local keep=" llvm mlir lld cmake third-party LICENSE.TXT README.md "
     shopt -s dotglob
     for e in "$root"/*; do
         base="$(basename "$e")"
         [[ "$keep" == *" $base "* ]] || rm -rf "$e"
     done
     shopt -u dotglob
+    # Of third-party/ only the header-only siphash lib is needed; benchmark/
+    # feeds LLVM_INCLUDE_BENCHMARKS and unittest/ feeds the *_INCLUDE_TESTS
+    # suites, and both of those are OFF in every flow here.
+    if [[ -d "$root/third-party" ]]; then
+        for e in "$root/third-party"/*; do
+            base="$(basename "$e")"
+            [[ "$base" == "siphash" ]] || rm -rf "$e"
+        done
+    fi
     # test suites: built with -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF
     rm -rf "$root/llvm/test" "$root/llvm/unittests" "$root/mlir/test" "$root/mlir/unittests"
     # belt & braces: any real symlinks left (Linux checkouts)
@@ -356,7 +376,7 @@ if ! exists_skip "$ROOT/3rdparty/llvm-project/llvm/CMakeLists.txt"; then
     capture_exec_list "$WORK/llvm-ta" "$WORK/exec-llvm-ta.list"
     trim_llvm_tree "$WORK/llvm-ta"
     place_tree "$WORK/llvm-ta" "$ROOT/3rdparty/llvm-project"
-    write_vendor_sha "$ROOT/3rdparty/llvm-project" "$LLVM_URL" "$LLVM_SHA" "$(basename "$LLVM_PATCH") PRE-APPLIED; trimmed to llvm+mlir+lld, no tests; build with -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF"
+    write_vendor_sha "$ROOT/3rdparty/llvm-project" "$LLVM_URL" "$LLVM_SHA" "$(basename "$LLVM_PATCH") PRE-APPLIED; trimmed to llvm+mlir+lld+cmake+third-party/siphash, no tests; build with -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF"
 fi
 
 # ---------------------------------------------------------------------------
@@ -405,7 +425,7 @@ access** at build time. Each tree carries a \`.vendor-sha\` provenance file.
 
 | Path | Upstream | Commit / Version | State |
 |---|---|---|
-| \`llvm-project/\` | github.com/llvm/llvm-project | \`$LLVM_SHA\` | triton-ascend \`llvm_patch/$(basename "$LLVM_PATCH")\` **pre-applied**; trimmed to \`llvm/+mlir/+lld\` (+ monorepo-root \`cmake/\`, required by \`llvm/CMakeLists.txt\`), test suites removed (build with \`-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF\`; FileCheck is kept, llvm-lit is not built and not needed) |
+| \`llvm-project/\` | github.com/llvm/llvm-project | \`$LLVM_SHA\` | triton-ascend \`llvm_patch/$(basename "$LLVM_PATCH")\` **pre-applied**; trimmed to \`llvm/+mlir/+lld\` (+ monorepo-root \`cmake/\` and \`third-party/siphash/\`, both required by \`llvm/CMakeLists.txt\`/\`llvm/lib/Support\`), test suites removed (build with \`-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF\`; FileCheck is kept, llvm-lit is not built and not needed) |
 | \`triton-ascend/\` | github.com/triton-lang/triton-ascend | \`$TA_SHA\` | pristine (submodule pin; \`3rdparty/triton-ascend.patch\` applies -- verified by vendor_deps.sh and build-step preflight; setup.py applies it at build time) |
 | \`triton-ascend/third_party/ascend/AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | pristine (triton-ascend's pin; setup.py applies \`3rdparty/AscendNPU-IR.patch\`; TA cmake builds it with \`BISHENGIR_BUILD_STANDALONE_IR_ONLY=ON\`, its \`third-party/\` is not needed) |
 | \`AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | standalone bisheng tool build (build-step 3); its \`third-party/llvm-project\` @ \`$NPU_LLVM_SHA\` has npuir's own \`build-tools/patches/llvm-project/*.patch\` **pre-applied** and is trimmed like above (incl. root \`cmake/\`); \`third-party/torch-mlir\` intentionally absent (\`BUILD_TORCH_MLIR=OFF\`) |
@@ -423,8 +443,10 @@ Notes:
 * The two LLVM trees are trimmed: clang/lldb/flang/libcxx/... and all
   \`test/\`+\`unittests/\` directories are absent, but the monorepo-root \`cmake/\`
   is kept (\`llvm/CMakeLists.txt\` sources \`CMakePolicy.cmake\`,
-  \`LLVMVersion.cmake\` and \`Modules/\` from it). This is safe because the
-  builds only enable \`mlir;llvm;lld\` (resp. \`mlir\`) and pass
+  \`LLVMVersion.cmake\` and \`Modules/\` from it) -- as is \`third-party/siphash/\`,
+  which holds the header-only \`SipHash.h\` that \`llvm/lib/Support/SipHash.cpp\`
+  includes via the \`LLVM_THIRD_PARTY_DIR\` include path. This is safe because
+  the builds only enable \`mlir;llvm;lld\` (resp. \`mlir\`) and pass
   \`*_INCLUDE_TESTS=OFF\`; FileCheck lives under \`llvm/utils\` (gated by
   \`LLVM_INCLUDE_UTILS\`, default ON) and is still built+installed. The
   \`mlir-doc\` target that setup.py builds comes from the *installed*
@@ -469,6 +491,7 @@ for f in \
     3rdparty/llvm-project/llvm/CMakeLists.txt \
     3rdparty/llvm-project/mlir/CMakeLists.txt \
     3rdparty/llvm-project/lld/CMakeLists.txt \
+    3rdparty/llvm-project/third-party/siphash/include/siphash/SipHash.h \
     3rdparty/llvm-project/mlir/lib/Dialect/SCF/IR/SCF.cpp \
     3rdparty/triton-ascend/cmake/llvm-hash.txt \
     3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR/CMakeLists.txt \
