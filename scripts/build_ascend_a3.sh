@@ -222,6 +222,7 @@ check_vendored() {  # non-zero (and logs [MISSING] lines) if 3rdparty/ is incomp
     for f in \
         3rdparty/llvm-project/llvm/CMakeLists.txt \
         3rdparty/llvm-project/third-party/siphash/include/siphash/SipHash.h \
+        3rdparty/llvm-project/libunwind/include/mach-o/compact_unwind_encoding.h \
         3rdparty/llvm-project/mlir/CMakeLists.txt \
         3rdparty/llvm-project/lld/CMakeLists.txt \
         3rdparty/triton-ascend/cmake/llvm-hash.txt \

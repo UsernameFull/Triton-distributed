@@ -21,15 +21,17 @@
 #   llvm-project/     llvm/llvm-project @ fad3272 (the commit recorded in
 #                     triton-ascend's cmake/llvm-hash.txt) with triton-ascend's
 #                     third_party/ascend/llvm_patch/fad3272.patch PRE-APPLIED.
-#                     Trimmed to llvm/ + mlir/ + lld/ (+ monorepo-root cmake/,
-#                     which llvm/CMakeLists.txt needs for CMakePolicy.cmake,
-#                     LLVMVersion.cmake and Modules/, + third-party/siphash/
-#                     alone -- header-only SipHash.h that llvm/lib/Support/
-#                     SipHash.cpp includes); test suites removed (built with
-#                     -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF, which
-#                     keeps FileCheck -- it is gated by LLVM_INCLUDE_UTILS --
-#                     and drops only llvm-lit, which nothing in this flow
-#                     consumes).
+#                     Trimmed to llvm/ + mlir/ + lld/ + the monorepo-root
+#                     cmake/ (llvm/CMakeLists.txt sources CMakePolicy.cmake,
+#                     LLVMVersion.cmake and Modules/ from it) + the two single
+#                     headers outside llvm/ that include paths reach for:
+#                     third-party/siphash/include/siphash/SipHash.h
+#                     (LLVMSupport) and libunwind/include/mach-o/
+#                     compact_unwind_encoding.h (lld/MachO). Test suites are
+#                     removed (built with -DLLVM_INCLUDE_TESTS=OFF
+#                     -DMLIR_INCLUDE_TESTS=OFF, which keeps FileCheck -- gated
+#                     by LLVM_INCLUDE_UTILS -- and drops only llvm-lit, which
+#                     nothing in this flow consumes).
 #   triton-ascend/    triton-lang/triton-ascend @ the submodule-pinned commit
 #                     (bfd8f55), PRISTINE: python/setup.py git-applies
 #                     3rdparty/triton-ascend.patch at build time (verified by
@@ -185,6 +187,20 @@ apply_exec_bits() {  # $1=list file $2=prefix under $ROOT (files must already be
     rm -f "$filtered"
 }
 
+prune_to() {  # $1=dir; rest = basenames to keep (rm -rf everything else in it)
+    local d="$1" e base k ok
+    shift
+    [[ -d "$d" ]] || return 0
+    for e in "$d"/*; do
+        base="$(basename "$e")"
+        ok=0
+        for k in "$@"; do
+            case "$base" in "$k") ok=1 ;; esac
+        done
+        [[ "$ok" == "1" ]] || rm -rf "$e"
+    done
+}
+
 trim_llvm_tree() {  # $1=llvm-project root; keep llvm+mlir+lld+cmake, drop test suites
     local root="$1" e base l
     # Drop git-declared symlinks FIRST (while .git still exists): on Windows
@@ -202,31 +218,43 @@ trim_llvm_tree() {  # $1=llvm-project root; keep llvm+mlir+lld+cmake, drop test 
     # whole Modules/ dir from the monorepo-root cmake/ (lines 6-20 + later
     # CMAKE_MODULE_PATH insert), so it must be kept even though we never
     # build clang/ & co.
-    # third-party/ must survive the trim: llvm/lib/Support/SipHash.cpp does
-    #   #include "siphash/SipHash.h"
-    # and llvm/lib/Support/CMakeLists.txt puts ${LLVM_THIRD_PARTY_DIR}/siphash/
-    # include on LLVMSupport include path. LLVM_THIRD_PARTY_DIR is
-    # ${CMAKE_CURRENT_SOURCE_DIR}/../third-party, and since CMake include()
-    # leaves CMAKE_CURRENT_SOURCE_DIR alone (verified: it stays <root>/llvm,
-    # the dir of llvm/CMakeLists.txt) that is exactly <root>/third-party.
-    # Dropping the whole dir is what made the build die with
-    #   llvm/lib/Support/SipHash.cpp:15:10: error: 'siphash/SipHash.h' file not found
-    local keep=" llvm mlir lld cmake third-party LICENSE.TXT README.md "
+    # Two headers under a *sibling* of llvm/ are pulled in by include paths
+    # that point outside llvm/, so both dirs have to survive the trim (dropping
+    # them en bloc is what broke the build twice):
+    #  * third-party/ -- llvm/lib/Support/SipHash.cpp does
+    #      #include "siphash/SipHash.h"
+    #    and llvm/lib/Support/CMakeLists.txt adds
+    #    ${LLVM_THIRD_PARTY_DIR}/siphash/include to LLVMSupport's include path,
+    #    where LLVM_THIRD_PARTY_DIR (HandleLLVMOptions.cmake) is
+    #    ${CMAKE_CURRENT_SOURCE_DIR}/../third-party. CMake's include() does not
+    #    change CMAKE_CURRENT_SOURCE_DIR (verified: it stays <root>/llvm, the
+    #    dir of llvm/CMakeLists.txt), so that is exactly <root>/third-party:
+    #      llvm/lib/Support/SipHash.cpp:15:10: error: 'siphash/SipHash.h' file not found
+    #  * libunwind/include/ -- lld/MachO/CMakeLists.txt adds
+    #    ${LLVM_MAIN_SRC_DIR}/../libunwind/include (LLVM_MAIN_SRC_DIR is
+    #    <root>/llvm, so <root>/libunwind/include) and
+    #    lld/MachO/{Target.h,Arch/ARM64.cpp,Arch/X86_64.cpp,UnwindInfoSection.cpp}
+    #    include "mach-o/compact_unwind_encoding.h", which only lives there:
+    #      fatal error: 'mach-o/compact_unwind_encoding.h' file not found
+    local keep=" llvm mlir lld cmake third-party libunwind LICENSE.TXT README.md "
     shopt -s dotglob
     for e in "$root"/*; do
         base="$(basename "$e")"
         [[ "$keep" == *" $base "* ]] || rm -rf "$e"
     done
     shopt -u dotglob
-    # Of third-party/ only the header-only siphash lib is needed; benchmark/
-    # feeds LLVM_INCLUDE_BENCHMARKS and unittest/ feeds the *_INCLUDE_TESTS
-    # suites, and both of those are OFF in every flow here.
-    if [[ -d "$root/third-party" ]]; then
-        for e in "$root/third-party"/*; do
-            base="$(basename "$e")"
-            [[ "$base" == "siphash" ]] || rm -rf "$e"
-        done
-    fi
+    # Reduced to exactly what those include paths need. third-party/: the
+    # header-only siphash lib (benchmark/ feeds LLVM_INCLUDE_BENCHMARKS and
+    # unittest/ feeds the *_INCLUDE_TESTS suites -- both OFF in every flow
+    # here). libunwind/: that one header, so the rest of the runtime (src/,
+    # test/, docs/ and the sibling headers, incl. its <unwind.h> replacement)
+    # stays out.
+    prune_to "$root/third-party"                 siphash
+    prune_to "$root/third-party/siphash"         include
+    prune_to "$root/third-party/siphash/include" siphash
+    prune_to "$root/libunwind"                   include
+    prune_to "$root/libunwind/include"           mach-o
+    prune_to "$root/libunwind/include/mach-o"    compact_unwind_encoding.h
     # test suites: built with -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF
     rm -rf "$root/llvm/test" "$root/llvm/unittests" "$root/mlir/test" "$root/mlir/unittests"
     # belt & braces: any real symlinks left (Linux checkouts)
@@ -376,7 +404,7 @@ if ! exists_skip "$ROOT/3rdparty/llvm-project/llvm/CMakeLists.txt"; then
     capture_exec_list "$WORK/llvm-ta" "$WORK/exec-llvm-ta.list"
     trim_llvm_tree "$WORK/llvm-ta"
     place_tree "$WORK/llvm-ta" "$ROOT/3rdparty/llvm-project"
-    write_vendor_sha "$ROOT/3rdparty/llvm-project" "$LLVM_URL" "$LLVM_SHA" "$(basename "$LLVM_PATCH") PRE-APPLIED; trimmed to llvm+mlir+lld+cmake+third-party/siphash, no tests; build with -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF"
+    write_vendor_sha "$ROOT/3rdparty/llvm-project" "$LLVM_URL" "$LLVM_SHA" "$(basename "$LLVM_PATCH") PRE-APPLIED; trimmed to llvm+mlir+lld+cmake+third-party/siphash+libunwind/include/mach-o, no tests; build with -DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF"
 fi
 
 # ---------------------------------------------------------------------------
@@ -425,7 +453,7 @@ access** at build time. Each tree carries a \`.vendor-sha\` provenance file.
 
 | Path | Upstream | Commit / Version | State |
 |---|---|---|
-| \`llvm-project/\` | github.com/llvm/llvm-project | \`$LLVM_SHA\` | triton-ascend \`llvm_patch/$(basename "$LLVM_PATCH")\` **pre-applied**; trimmed to \`llvm/+mlir/+lld\` (+ monorepo-root \`cmake/\` and \`third-party/siphash/\`, both required by \`llvm/CMakeLists.txt\`/\`llvm/lib/Support\`), test suites removed (build with \`-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF\`; FileCheck is kept, llvm-lit is not built and not needed) |
+| \`llvm-project/\` | github.com/llvm/llvm-project | \`$LLVM_SHA\` | triton-ascend \`llvm_patch/$(basename "$LLVM_PATCH")\` **pre-applied**; trimmed to \`llvm/+mlir/+lld\` (+ monorepo-root \`cmake/\` and the out-of-tree headers \`third-party/siphash/\` and \`libunwind/include/mach-o/\`, required by \`llvm/CMakeLists.txt\`/\`llvm/lib/Support\`/\`lld/MachO\`), test suites removed (build with \`-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF\`; FileCheck is kept, llvm-lit is not built and not needed) |
 | \`triton-ascend/\` | github.com/triton-lang/triton-ascend | \`$TA_SHA\` | pristine (submodule pin; \`3rdparty/triton-ascend.patch\` applies -- verified by vendor_deps.sh and build-step preflight; setup.py applies it at build time) |
 | \`triton-ascend/third_party/ascend/AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | pristine (triton-ascend's pin; setup.py applies \`3rdparty/AscendNPU-IR.patch\`; TA cmake builds it with \`BISHENGIR_BUILD_STANDALONE_IR_ONLY=ON\`, its \`third-party/\` is not needed) |
 | \`AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | standalone bisheng tool build (build-step 3); its \`third-party/llvm-project\` @ \`$NPU_LLVM_SHA\` has npuir's own \`build-tools/patches/llvm-project/*.patch\` **pre-applied** and is trimmed like above (incl. root \`cmake/\`); \`third-party/torch-mlir\` intentionally absent (\`BUILD_TORCH_MLIR=OFF\`) |
@@ -443,9 +471,13 @@ Notes:
 * The two LLVM trees are trimmed: clang/lldb/flang/libcxx/... and all
   \`test/\`+\`unittests/\` directories are absent, but the monorepo-root \`cmake/\`
   is kept (\`llvm/CMakeLists.txt\` sources \`CMakePolicy.cmake\`,
-  \`LLVMVersion.cmake\` and \`Modules/\` from it) -- as is \`third-party/siphash/\`,
-  which holds the header-only \`SipHash.h\` that \`llvm/lib/Support/SipHash.cpp\`
-  includes via the \`LLVM_THIRD_PARTY_DIR\` include path. This is safe because
+  \`LLVMVersion.cmake\` and \`Modules/\` from it) -- as are the two out-of-tree headers the include paths reach for:
+  \`third-party/siphash/\` (header-only \`SipHash.h\`, pulled in by
+  \`llvm/lib/Support/SipHash.cpp\` through the \`LLVM_THIRD_PARTY_DIR\` include
+  path) and \`libunwind/include/mach-o/compact_unwind_encoding.h\` (pulled in
+  by \`lld/MachO/{Target.h,Arch/ARM64.cpp,Arch/X86_64.cpp,UnwindInfoSection.cpp}\`
+  through the sibling-\`libunwind/include\` include path; the rest of
+  \`libunwind/\` is dropped). This is safe because
   the builds only enable \`mlir;llvm;lld\` (resp. \`mlir\`) and pass
   \`*_INCLUDE_TESTS=OFF\`; FileCheck lives under \`llvm/utils\` (gated by
   \`LLVM_INCLUDE_UTILS\`, default ON) and is still built+installed. The
@@ -492,6 +524,7 @@ for f in \
     3rdparty/llvm-project/mlir/CMakeLists.txt \
     3rdparty/llvm-project/lld/CMakeLists.txt \
     3rdparty/llvm-project/third-party/siphash/include/siphash/SipHash.h \
+    3rdparty/llvm-project/libunwind/include/mach-o/compact_unwind_encoding.h \
     3rdparty/llvm-project/mlir/lib/Dialect/SCF/IR/SCF.cpp \
     3rdparty/triton-ascend/cmake/llvm-hash.txt \
     3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR/CMakeLists.txt \
