@@ -242,3 +242,41 @@ and see the following (reduced) output
 [PASS] Rank0: C_golden and C match within tolerances (rtol=1e-3, atol=1e-3).
 [PASS] Rank1: C_golden and C match within tolerances (rtol=1e-3, atol=1e-3).
 ```
+
+#### Troubleshooting: the example crashes with `exitcode -11` (SIGSEGV)
+
+A segfault with no Python traceback can come from three different layers --
+Triton/Ascend lowering (`libtriton`), the ACLSHMEM/CANN/torch_npu/HCCL runtime,
+or the tutorial's own kernel -- and each one needs a different fix.
+`scripts/triage_ascend_runtime.sh` runs a small ladder (a device-free
+compiler-IR test, then aclshmem init, then progressively heavier distributed
+kernels, then the tutorial itself) so that the **first failing stage** bounds
+the problem:
+
+```sh
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export PATH=$HOME/ascend-build/AscendNPU-IR/build/bin:$PATH
+bash scripts/triage_ascend_runtime.sh            # STOP_ON_FAIL=0 runs every stage
+```
+
+It writes a full log under `$HOME/ascend-build/triage-logs/`. The most common
+causes of `-11`:
+
+* a **stale `~/.triton/cache`** written by a *different* `libtriton` (e.g. right
+  after switching from a preinstalled wheel to this checkout) -- the cached
+  device binary no longer matches the runtime. Wipe it with
+  `CLEAR_CACHE=1 bash scripts/triage_ascend_runtime.sh` (or `rm -rf ~/.triton/cache`);
+* **`bishengir-compile` not on `PATH`** -- the exported
+  `$HOME/ascend-build/AscendNPU-IR/build/bin` is what compiles the kernel at run
+  time, so run the examples from a shell that has it;
+* **`triton` / `shmem` resolving to a preinstalled package** in `site-packages`
+  instead of this checkout -- `scripts/build_ascend_a3.sh` purges shadowing
+  installs and verifies the resolved `libtriton`, and the triage log prints the
+  `__file__` of every relevant module so you can confirm.
+
+If the ladder blames the compiler layer, capture the MLIR dump for a bug report:
+
+```sh
+MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 \
+    python3 -m pytest python/triton_dist/test/ascend/test_gm_addr_args_indices.py
+```
