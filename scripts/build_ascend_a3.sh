@@ -53,8 +53,19 @@
 #   CANN_ENV           [/usr/local/Ascend/ascend-toolkit/set_env.sh]
 #   CLANG_BIN/CLANGXX_BIN/LD_BIN   [auto-detected clang(-15)/lld]
 #   JOBS               [min(nproc, MemTotal/2GB)]
-#   PIP_NO_INDEX       [1]  pass --no-index to pip (set to "" if the host has
-#                           a reachable PyPI mirror and needs missing deps)
+#   PIP_NO_INDEX       [1]  pass --no-index to the pip installs performed by the
+#                           script itself (the triton-dist editable + the shmem
+#                           wheel, both LOCAL builds, so --no-index is correct;
+#                           set "" if those two installs should reach the net)
+#   AUTO_INSTALL_DEPS  [1]  auto-install MISSING python build tooling
+#                           (setuptools/wheel/pybind11/cmake/ninja/pytest) from
+#                           PIP_INDEX_URL; 0 = strict offline (check + die only)
+#   PIP_INDEX_URL      [Tsinghua PyPI mirror] index used by AUTO_INSTALL_DEPS
+#   AUTO_VENDOR        [1]  when 3rdparty/ is incomplete, run
+#                           scripts/vendor_deps.sh automatically (needs network
+#                           to github.com/gitcode.com, curl, ~8 GB scratch) and
+#                           commit the result, so setup.py's clean-tree patch
+#                           step still works; 0 = only report the gaps
 #   RUN_TESTS          [0]
 set -euo pipefail
 
@@ -72,6 +83,9 @@ RUN_TESTS="${RUN_TESTS:-0}"
 FORCE="${FORCE:-0}"
 PIP_NO_INDEX="${PIP_NO_INDEX-1}"
 if [[ -n "$PIP_NO_INDEX" ]]; then PIP_INDEX_FLAGS="--no-index"; else PIP_INDEX_FLAGS=""; fi
+AUTO_INSTALL_DEPS="${AUTO_INSTALL_DEPS:-1}"
+AUTO_VENDOR="${AUTO_VENDOR:-1}"
+PIP_INDEX_URL="${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
 
 MEM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 8)
 NPROC=$(nproc 2>/dev/null || echo 4)
@@ -89,6 +103,46 @@ die() { echo "[ERROR] $*" >&2; echo "[ERROR] see log: $LOG_FILE" >&2; exit 1; }
 vendor_sha() { awk -F= '$1=="sha"{print $2}' "$1/.vendor-sha" 2>/dev/null || echo unknown; }
 version_at_least() { # $1=version $2=minimum -> 0 if $1 >= $2
     [[ "$(printf '%s\n%s' "$2" "$1" | sort -V | head -1)" == "$2" ]]
+}
+run_pip() {  # "$@" = pip args; falls back to `python3 -m pip` when no pip binary
+    if [[ -n "${PIP_BIN:-}" ]]; then "$PIP_BIN" "$@"; else python3 -m pip "$@"; fi
+}
+install_py_dep() {  # $1=python import name $2=pip spec -> ensure `python3 -c "import $1"`
+    local mod="$1" spec="$2"
+    python3 -c "import $mod" >/dev/null 2>&1 && return 0
+    [[ "$AUTO_INSTALL_DEPS" == "1" ]] \
+        || die "python module '$mod' is missing and AUTO_INSTALL_DEPS=0 -- pip install $spec"
+    echo "[deps] installing $spec from $PIP_INDEX_URL ..."
+    run_pip install --index-url "$PIP_INDEX_URL" "$spec" \
+        || die "failed to install $spec from $PIP_INDEX_URL -- point PIP_INDEX_URL at a reachable index (or preinstall it) and re-run"
+    python3 -c "import $mod" >/dev/null 2>&1 \
+        || die "$spec installed but '$mod' is still not importable -- pip/python version mismatch?"
+}
+install_cmd_dep() {  # $1=command on PATH $2=pip spec -> ensure `command -v $1`
+    local cmd="$1" spec="$2"
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+    [[ "$AUTO_INSTALL_DEPS" == "1" ]] \
+        || die "$cmd not installed and AUTO_INSTALL_DEPS=0 -- pip install $spec"
+    echo "[deps] installing $spec from $PIP_INDEX_URL ..."
+    run_pip install --index-url "$PIP_INDEX_URL" "$spec" \
+        || die "failed to install $spec from $PIP_INDEX_URL -- point PIP_INDEX_URL at a reachable index and re-run"
+    hash -r 2>/dev/null || true
+    command -v "$cmd" >/dev/null 2>&1 \
+        || die "$cmd still not on PATH after installing $spec -- check PATH / activate the right venv"
+}
+ensure_cmd_version() {  # $1=cmd $2=min version $3=pip spec -> ensure `$1 --version` >= $2
+    local cmd="$1" min="$2" spec="$3" ver
+    ver=$("$cmd" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)
+    version_at_least "${ver:-0}" "$min" && return 0
+    [[ "$AUTO_INSTALL_DEPS" == "1" ]] \
+        || die "$cmd >= $min required, got ${ver:-unknown} (AUTO_INSTALL_DEPS=0)"
+    echo "[deps] $cmd ${ver:-unknown} is too old (need >= $min) -- installing $spec from $PIP_INDEX_URL ..."
+    run_pip install --index-url "$PIP_INDEX_URL" --upgrade "$spec" \
+        || die "failed to install $spec from $PIP_INDEX_URL"
+    hash -r 2>/dev/null || true
+    ver=$("$cmd" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1 || true)
+    version_at_least "${ver:-0}" "$min" \
+        || die "$cmd >= $min still required after installing $spec, got ${ver:-unknown} -- check PATH (the pip bin dir may not be first)"
 }
 trap 'echo "[ERROR] failed at line $LINENO (step: ${STEP:-unknown}), log: $LOG_FILE" >&2' ERR
 
@@ -108,23 +162,33 @@ npu-smi info | head -8 || true
 source "$CANN_ENV"
 echo "CANN: ${ASCEND_TOOLKIT_HOME:-unknown} | ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-unset}"
 
-for tool in git python3 cmake ninja; do
+for tool in git python3; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not installed"
 done
-PIP_BIN=$(command -v pip || command -v pip3 || true)
-[[ -n "$PIP_BIN" ]] || die "neither pip nor pip3 found"
-CMAKE_VER=$(cmake --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-version_at_least "$CMAKE_VER" 3.28 \
-    || die "cmake >= 3.28 required (AscendNPU-IR), got $CMAKE_VER"
-NINJA_VER=$(ninja --version 2>/dev/null || echo 0)
-version_at_least "$NINJA_VER" 1.12 \
-    || die "ninja >= 1.12 required (AscendNPU-IR), got $NINJA_VER"
 
+# pip is either a binary (pip/pip3) or reachable as `python3 -m pip`.
+PIP_BIN=$(command -v pip || command -v pip3 || true)
+if [[ -z "$PIP_BIN" ]]; then
+    python3 -m pip --version >/dev/null 2>&1 \
+        || die "no pip available (tried pip, pip3, python3 -m pip)"
+fi
+
+# Build tooling: auto-install ONLY what is missing (or too old), from the
+# mirror. AUTO_INSTALL_DEPS=1 by default; 0 = strict offline check-and-die.
+install_py_dep setuptools setuptools
+install_py_dep wheel      wheel
+install_py_dep pybind11   pybind11
+install_py_dep pytest     pytest
+install_cmd_dep cmake cmake
+install_cmd_dep ninja ninja
+ensure_cmd_version cmake 3.28 "cmake>=3.28"
+ensure_cmd_version ninja 1.12 "ninja>=1.12"
+
+# torch/torch_npu are CANN-paired wheels that are NOT on PyPI -- never try to
+# auto-install them, just fail loudly with the pairing hint.
 python3 -c "import torch, torch_npu" 2>/dev/null \
-    || die "torch/torch_npu not importable (CANN 9.1.0 pairs with torch_npu==2.7.1.post8)"
+    || die "torch/torch_npu not importable (CANN 9.1.0 pairs with torch_npu==2.7.1.post8; use the official triton-ascend A3 image)"
 python3 -c "import torch, torch_npu; print('torch', torch.__version__, '| torch_npu', torch_npu.__version__, '| npu:', torch.npu.is_available())"
-python3 -c "import pybind11" 2>/dev/null \
-    || die "python pybind11 not importable (needed by setup.py under --no-build-isolation; pip install pybind11 or set PYBIND11_SYSPATH)"
 
 # compilers for the LLVM build: prefer clang-15 (docs/build.md), accept any clang
 CLANG_BIN="${CLANG_BIN:-$(command -v clang-15 || command -v clang || true)}"
@@ -153,29 +217,61 @@ df -h "$WORK_ROOT" | tail -1
 STEP=1-vendored
 banner "step 1: vendored dependency check ($REPO_DIR/3rdparty)"
 
-vendored_missing=0
-for f in \
-    3rdparty/llvm-project/llvm/CMakeLists.txt \
-    3rdparty/llvm-project/mlir/CMakeLists.txt \
-    3rdparty/llvm-project/lld/CMakeLists.txt \
-    3rdparty/triton-ascend/cmake/llvm-hash.txt \
-    3rdparty/triton-ascend/third_party/ascend/backend/compiler.py \
-    3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR/CMakeLists.txt \
-    3rdparty/AscendNPU-IR/build-tools/build.sh \
-    3rdparty/AscendNPU-IR/third-party/llvm-project/llvm/CMakeLists.txt \
-    3rdparty/shmem/scripts/build.sh \
-    3rdparty/nlohmann-json/include/nlohmann/json.hpp \
-    3rdparty/triton-ascend.patch \
-    3rdparty/AscendNPU-IR.patch
-do
-    if [[ -e "$REPO_DIR/$f" ]]; then
-        echo "[OK] $f"
+check_vendored() {  # non-zero (and logs [MISSING] lines) if 3rdparty/ is incomplete
+    local f missing=0
+    for f in \
+        3rdparty/llvm-project/llvm/CMakeLists.txt \
+        3rdparty/llvm-project/mlir/CMakeLists.txt \
+        3rdparty/llvm-project/lld/CMakeLists.txt \
+        3rdparty/triton-ascend/cmake/llvm-hash.txt \
+        3rdparty/triton-ascend/third_party/ascend/backend/compiler.py \
+        3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR/CMakeLists.txt \
+        3rdparty/AscendNPU-IR/build-tools/build.sh \
+        3rdparty/AscendNPU-IR/third-party/llvm-project/llvm/CMakeLists.txt \
+        3rdparty/shmem/scripts/build.sh \
+        3rdparty/nlohmann-json/include/nlohmann/json.hpp \
+        3rdparty/triton-ascend.patch \
+        3rdparty/AscendNPU-IR.patch
+    do
+        if [[ -e "$REPO_DIR/$f" ]]; then
+            echo "[OK] $f"
+        else
+            echo "[MISSING] $f" >&2
+            missing=1
+        fi
+    done
+    return "$missing"
+}
+
+if ! check_vendored; then
+    [[ "$AUTO_VENDOR" == "1" ]] \
+        || die "vendored dependencies incomplete -- run scripts/vendor_deps.sh on a networked machine and commit the result, or re-run with AUTO_VENDOR=1 (see 3rdparty/VENDORED.md)"
+    echo "[vendor] 3rdparty/ is incomplete -- running scripts/vendor_deps.sh"
+    echo "[vendor] this needs network (github.com + gitcode.com), curl and ~8 GB free scratch"
+    index_dirty_before=0
+    git -C "$REPO_DIR" diff-index --cached --quiet HEAD -- 2>/dev/null \
+        || index_dirty_before=1
+    bash "$REPO_DIR/scripts/vendor_deps.sh" \
+        || die "scripts/vendor_deps.sh failed -- verify network access to github.com/gitcode.com, or vendor 3rdparty/ on another machine and commit it (see 3rdparty/VENDORED.md)"
+    check_vendored \
+        || die "3rdparty/ is still incomplete after vendor_deps.sh -- see the [MISSING] lines above and 3rdparty/VENDORED.md"
+    [[ "$index_dirty_before" == "0" ]] \
+        || die "vendor_deps.sh staged the vendored trees but the index already had other staged changes; commit 3rdparty/ yourself and re-run (setup.py applies 3rdparty/*.patch only when the whole repo is clean)"
+    # setup.py git-applies 3rdparty/*.patch only when the repo is clean, and
+    # vendor_deps.sh leaves its work STAGED -- so commit it. The index was clean
+    # before vendoring, hence this commit contains only the vendored files.
+    echo "[vendor] committing the vendored 3rdparty/ trees (index was clean before)"
+    if git -C "$REPO_DIR" config user.email >/dev/null 2>&1 \
+       && git -C "$REPO_DIR" config user.name >/dev/null 2>&1; then
+        git -C "$REPO_DIR" commit -q -m "vendor: offline Ascend build dependencies (auto; see 3rdparty/VENDORED.md)" \
+            || die "failed to commit the vendored trees -- commit 3rdparty/ by hand and re-run"
     else
-        echo "[MISSING] $f" >&2
-        vendored_missing=1
+        git -C "$REPO_DIR" -c user.name="triton-dist offline build" \
+            -c user.email="offline-build@localhost" \
+            commit -q -m "vendor: offline Ascend build dependencies (auto; see 3rdparty/VENDORED.md)" \
+            || die "failed to commit the vendored trees -- commit 3rdparty/ by hand and re-run"
     fi
-done
-[[ "$vendored_missing" == "0" ]] || die "vendored dependencies incomplete -- run scripts/vendor_deps.sh on a networked Linux machine and commit/copy the repo over (see 3rdparty/VENDORED.md)"
+fi
 
 # The vendored trees must be COMMITTED: python/setup.py decides whether to
 # apply 3rdparty/*.patch via a whole-repo `git diff-index --quiet HEAD` check,
@@ -234,6 +330,21 @@ else
     # LLVM_INCLUDE_UTILS and is still built; llvm-lit is not built and nothing
     # in this flow needs it). third-party/benchmark (google/benchmark
     # submodule) was never vendored, hence INCLUDE_BENCHMARKS=OFF.
+    # *** Guard: a `#` comment must NEVER appear inside the continued `cmake`
+    # *** command below. bash ends the command at the `#` even when the
+    # *** previous line continued it, so every following -D... line is then
+    # *** executed as a shell command and never reaches cmake -- which is
+    # *** exactly what produced the historical failure this fixes:
+    # ***   CMake Error ... add_subdirectory given source "unittests"
+    # ***   which is not an existing directory
+    # *** (-DLLVM_INCLUDE_TESTS=OFF / -DMLIR_INCLUDE_TESTS=OFF never reached
+    # *** cmake, so the test-trimmed tree still tried to build its tests).
+    #
+    # Pin the LLVM version explicitly: a stale CMakeCache.txt can otherwise
+    # carry these as DEFINED-but-empty, which makes project(VERSION ..) fail
+    # with `VERSION ".." format invalid` at llvm/CMakeLists.txt:46. Values
+    # match the vendored tree's own cmake/Modules/LLVMVersion.cmake defaults
+    # (fad3272); command-line -D always wins over the cache.
     cmake -S "$REPO_DIR/3rdparty/llvm-project/llvm" -B "$LLVM_BUILD_DIR" -G Ninja \
         -DCMAKE_C_COMPILER="$CLANG_BIN" \
         -DCMAKE_CXX_COMPILER="$CLANGXX_BIN" \
@@ -243,11 +354,6 @@ else
         -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld" \
         -DLLVM_TARGETS_TO_BUILD="host;NVPTX;AMDGPU" \
         -DLLVM_ENABLE_LLD=ON \
-        # Pin the LLVM version explicitly: a stale CMakeCache.txt can otherwise
-        # carry these as DEFINED-but-empty, which makes project(VERSION ..)
-        # fail with `VERSION ".." format invalid` at llvm/CMakeLists.txt:46.
-        # Values match the vendored tree's own cmake/Modules/LLVMVersion.cmake
-        # defaults (fad3272); command-line -D always wins over the cache.
         -DLLVM_VERSION_MAJOR=22 \
         -DLLVM_VERSION_MINOR=0 \
         -DLLVM_VERSION_PATCH=0 \
@@ -287,8 +393,14 @@ else
     #     trees; plain `ninja` builds a superset of the required binaries)
     #   * *_INCLUDE_TESTS=OFF + INCLUDE_BENCHMARKS=OFF via --add-cmake-options
     #     (test suites and third-party/benchmark were trimmed from the tree)
+    # Flag names verified against 3rdparty/AscendNPU-IR/build-tools/build.sh
+    # (--help): the compiler path option is --bisheng-compiler=<dir>, NOT
+    # --bisheng-compile, and the template switch is -t/--build-bishengir-template,
+    # NOT --build-shmem-template. An unknown option aborts at argument-parse time
+    # with `Error: Unknown option: --bisheng-compile=<dir>`. The template build is
+    # OFF by default and unused by this flow, so it is simply dropped.
     bash ./build-tools/build.sh -o ./build -j "$JOBS" --build-type Release \
-        --bisheng-compile="$ASCEND_HOME_PATH/bin" --build-shmem-template \
+        --bisheng-compiler="$ASCEND_HOME_PATH/bin" \
         --add-cmake-options="-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF"
     echo "$NPU_SHA" > "$WORK_ROOT/.stamp_npu_ir"
 fi
@@ -320,7 +432,7 @@ else
     TRITON_OFFLINE_BUILD=1 \
     JSON_SYSPATH="$REPO_DIR/3rdparty/nlohmann-json" \
     TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF" \
-    "$PIP_BIN" install -e ./python --verbose --no-build-isolation $PIP_INDEX_FLAGS
+    run_pip install -e ./python --verbose --no-build-isolation $PIP_INDEX_FLAGS
     echo "$DIST_FINGERPRINT" > "$WORK_ROOT/.stamp_triton_dist"
 fi
 
@@ -345,7 +457,7 @@ else
     bash scripts/build.sh -python_extension
     whl=$(ls -t dist/shmem-*.whl 2>/dev/null | head -1 || true)
     [[ -n "$whl" ]] || die "shmem wheel not found in $SHMEM_DIR/dist"
-    "$PIP_BIN" install $PIP_INDEX_FLAGS "$whl"
+    run_pip install $PIP_INDEX_FLAGS "$whl"
     echo "$SHMEM_SHA" > "$WORK_ROOT/.stamp_shmem"
 fi
 
