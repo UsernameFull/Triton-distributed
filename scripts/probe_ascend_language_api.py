@@ -21,6 +21,7 @@ Usage:
     python scripts/probe_ascend_language_api.py
 """
 import inspect
+import os
 import shutil
 import sys
 
@@ -53,10 +54,60 @@ def probe_environment():
         sys.exit(1)
 
 
+def probe_libtriton_backends():
+    """The imported `triton` must be this checkout's build and carry the
+    `distributed` backend.
+
+    `triton_dist/language/distributed_ops.py` does
+    `from triton._C.libtriton.distributed import ir`. If a stock
+    triton/triton-ascend wheel (whose libtriton.so has no `distributed` plugin)
+    shadows the editable install, that import fails with the very confusing
+      ModuleNotFoundError: triton._C.libtriton is not a package
+    """
+    print()
+    print("=" * 72)
+    print("2. libtriton source + backends (distributed/ascend)")
+    print("=" * 72)
+    import triton
+
+    print(f"  triton {triton.__version__} from {triton.__file__}")
+    c_dir = os.path.join(os.path.dirname(os.path.abspath(triton.__file__)), "_C")
+    report("triton/_C directory", os.path.isdir(c_dir), c_dir)
+    if not os.path.isdir(c_dir):
+        return
+    libs = sorted(n for n in os.listdir(c_dir) if n.startswith("libtriton"))
+    print(f"  {c_dir}: {libs}")
+    report("libtriton.<ext> in triton/_C", any(n.startswith("libtriton.") for n in libs))
+    report("libtriton_distributed.<ext> in triton/_C", any(n.startswith("libtriton_distributed.") for n in libs))
+
+    try:
+        from triton._C import libtriton
+    except Exception as e:  # noqa: BLE001
+        report("from triton._C import libtriton", False, repr(e))
+        return
+    report("from triton._C import libtriton", True, libtriton.__file__)
+
+    for sub in ("ir", "llvm", "ascend", "distributed"):
+        report(f"libtriton.{sub} submodule", hasattr(libtriton, sub))
+
+    # This is exactly what triton_dist/language/distributed_ops.py imports.
+    try:
+        from triton._C.libtriton.distributed import ir  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        report("from triton._C.libtriton.distributed import ir", False, repr(e))
+        print("  ^ 'triton._C.libtriton is not a package' here means the imported")
+        print("    'triton' is NOT this checkout's build: a preinstalled stock")
+        print("    triton/triton-ascend wheel shadows the editable install. Fix:")
+        print("        pip uninstall -y triton triton-ascend")
+        print("        FORCE=1 bash scripts/build_ascend_a3.sh   # or build_ascend_a2.sh")
+    else:
+        report("from triton._C.libtriton.distributed import ir", True)
+
+
 def probe_symbols():
     print()
     print("=" * 72)
-    print("2. Symbol availability")
+    print("3. Symbol availability")
     print("=" * 72)
     try:
         import triton.language.extra.cann.extension as ext
@@ -74,7 +125,7 @@ def probe_symbols():
 def probe_signatures():
     print()
     print("=" * 72)
-    print("3. Signatures (sem/scope support decides _MEM_ORDER_PASSTHROUGH)")
+    print("4. Signatures (sem/scope support decides _MEM_ORDER_PASSTHROUGH)")
     print("=" * 72)
     import triton.language as tl
     for name in ("atomic_add", "atomic_cas", "load", "store"):
@@ -94,7 +145,7 @@ def probe_signatures():
 def probe_smoke_compile():
     print()
     print("=" * 72)
-    print("4. Kernel smoke compilation on NPU (requires torch_npu + device)")
+    print("5. Kernel smoke compilation on NPU (requires torch_npu + device)")
     print("=" * 72)
     try:
         import torch
@@ -155,6 +206,7 @@ def probe_smoke_compile():
 
 def main():
     probe_environment()
+    probe_libtriton_backends()
     probe_symbols()
     probe_signatures()
     probe_smoke_compile()

@@ -24,7 +24,22 @@
 ################################################################################
 from triton.language import core as tlc
 from triton.language.core import builtin
-from triton._C.libtriton.distributed import ir
+try:
+    from triton._C.libtriton.distributed import ir
+except ImportError as _err:
+    # "triton._C.libtriton is not a package" (ModuleNotFoundError) means the
+    # *imported* `triton` is not this repo's build: a stock triton/triton-ascend
+    # wheel shadows the editable install and its libtriton.so has no
+    # `distributed` backend. Report that instead of the cryptic original error.
+    import sys as _sys
+    raise ImportError(
+        "cannot import triton._C.libtriton.distributed (the libtriton backend built "
+        f"by Triton-distributed): the active 'triton' package is "
+        f"{getattr(_sys.modules.get('triton'), '__file__', '<unknown>')}. A preinstalled "
+        "stock triton/triton-ascend wheel shadows this checkout's editable install -- "
+        "remove it with `pip uninstall -y triton triton-ascend` and reinstall this repo "
+        "with `pip install -e ./python`."
+    ) from _err
 
 
 def _str_to_dist_signal_op(sig_op):

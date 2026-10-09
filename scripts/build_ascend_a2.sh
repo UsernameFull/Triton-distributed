@@ -112,6 +112,12 @@
 #                           commit the result, so setup.py's clean-tree patch
 #                           step still works; 0 = only report the gaps
 #   RUN_TESTS          [0]
+#
+# Step 4 also removes any preinstalled triton / triton-ascend first, so that
+# `import triton` resolves to THIS checkout's editable install (whose
+# libtriton.so carries the `distributed` backend), and then verifies it.
+# Skipping that removal is what makes a successful build fail at runtime with
+#     triton._C.libtriton is not a package
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -190,6 +196,89 @@ ensure_cmd_version() {  # $1=cmd $2=min version $3=pip spec -> ensure `$1 --vers
     version_at_least "${ver:-0}" "$min" \
         || die "$cmd >= $min still required after installing $spec, got ${ver:-unknown} -- check PATH (the pip bin dir may not be first)"
 }
+# --- foreign-triton handling (step 4) ---------------------------------------
+# `pip install -e ./python` exposes the top-level `triton` package through a
+# setuptools meta-path finder that is *appended* to sys.meta_path (see
+# setuptools/command/editable_wheel.py: sys.meta_path.append(_EditableFinder)),
+# so the ordinary PathFinder -- and therefore everything already installed in
+# site-packages -- is consulted FIRST. A preinstalled `triton` / `triton-ascend`
+# wheel (the official A3/A2 images ship one; both provide the same top-level
+# `triton` package) therefore keeps winning over the editable install, and its
+# libtriton.so was built without the `distributed` plugin, so the first
+# `import triton_dist` dies with
+#     triton._C.libtriton is not a package
+# (raised inside python/triton_dist/language/distributed_ops.py, which imports
+# `triton._C.libtriton.distributed`). docs/build.md tells users to run
+# `pip uninstall triton` first; this script now does that itself.
+purge_shadowing_triton() {
+    echo "[triton] uninstalling any preinstalled triton/triton-ascend/triton_dist ..."
+    run_pip uninstall -y triton triton-ascend triton_dist triton-distributed >/dev/null 2>&1 || true
+    # `pip uninstall` can leave files behind (partially tracked installs, conda
+    # images); a leftover site-packages/triton/ dir shadows us just as badly.
+    # Never touch a symlink (setup.py's add_link_to_distributed creates one) and
+    # never touch anything inside this checkout.
+    local sp real real_repo
+    real_repo="$(cd "$REPO_DIR" && pwd -P)"
+    while IFS= read -r sp; do
+        [[ -n "$sp" && -d "$sp/triton" && ! -L "$sp/triton" ]] || continue
+        real="$(cd "$sp/triton" 2>/dev/null && pwd -P || true)"
+        [[ -n "$real" && "$real" == "$real_repo"* ]] && continue
+        echo "[triton] removing leftover $sp/triton (would shadow the editable install)"
+        rm -rf "$sp/triton"
+    done < <(python3 -c 'import site; [print(p) for p in dict.fromkeys([*site.getsitepackages(), site.getusersitepackages()]) if p]' 2>/dev/null || true)
+}
+
+# Hard-verify that `import triton` resolves to THIS checkout and that the loaded
+# libtriton.so really carries the `distributed` (and `ascend`) plugins. Without
+# this the shadowing above only surfaces as a confusing error deep inside
+# triton_dist -- long after "Successfully installed".
+verify_triton_dist_install() {
+    TRITON_DIST_REPO_DIR="$REPO_DIR" python3 - <<'PY'
+import os
+import sys
+
+repo = os.path.realpath(os.environ["TRITON_DIST_REPO_DIR"])
+import triton  # must already resolve to this checkout
+
+where = os.path.realpath(triton.__file__)
+print(f"[triton] triton {triton.__version__} from {triton.__file__}")
+if not where.startswith(repo + os.sep):
+    sys.exit(
+        f"ERROR: 'triton' is imported from {where}\n"
+        f"       instead of this checkout ({repo}).\n"
+        "       A preinstalled triton/triton-ascend wheel shadows the editable\n"
+        "       install; its libtriton.so has no 'distributed' plugin, which shows\n"
+        "       up as \"triton._C.libtriton is not a package\".\n"
+        "       Fix: pip uninstall -y triton triton-ascend, then FORCE=1 re-run."
+    )
+
+from triton._C import libtriton  # loads <checkout>/python/triton/_C/libtriton.so
+print(f"[triton] libtriton from {libtriton.__file__}")
+missing = [name for name in ("ir", "llvm", "ascend", "distributed") if not hasattr(libtriton, name)]
+if missing:
+    sys.exit(
+        f"ERROR: the loaded libtriton.so has no {', '.join(missing)} submodule(s)\n"
+        f"       ({libtriton.__file__}).\n"
+        "       It was not built from this checkout: rebuild with TRITON_USE_ASCEND=ON\n"
+        "       (this script) and make sure no stock triton/triton-ascend wheel is\n"
+        "       installed."
+    )
+
+# The exact import that failed at runtime.
+from triton._C.libtriton.distributed import ir as _distributed_ir  # noqa: F401
+from triton._C.libtriton.distributed import ascend_passes as _ascend_passes  # noqa: F401
+print("[triton] triton._C.libtriton.distributed.{ir,ascend_passes} importable")
+
+# Soft check: the full user-facing import chain (torch/torch_npu are heavy).
+try:
+    import triton_dist.language  # noqa: F401
+    print("[triton] import triton_dist.language OK")
+except Exception as exc:  # noqa: BLE001
+    print(f"[triton] WARN: import triton_dist.language failed: {type(exc).__name__}: {exc}")
+    print("[triton]       the triton/libtriton checks above passed -- see step 6 probe")
+PY
+}
+
 trap 'echo "[ERROR] failed at line $LINENO (step: ${STEP:-unknown}), log: $LOG_FILE" >&2' ERR
 
 # ---------------------------------------------------------------------------
@@ -511,15 +600,20 @@ banner "step 4: pip install -e ./python (TRITON_USE_ASCEND=ON, offline)"
 cd "$REPO_DIR"
 DIST_FINGERPRINT="$(git -C "$REPO_DIR" rev-parse HEAD)"
 if [[ "$FORCE" != "1" && -f "$WORK_ROOT/.stamp_triton_dist" \
-      && "$(cat "$WORK_ROOT/.stamp_triton_dist")" == "$DIST_FINGERPRINT" ]]; then
-    echo "Triton-distributed already installed for this exact source combo, skipping. FORCE=1 to rebuild."
+      && "$(cat "$WORK_ROOT/.stamp_triton_dist")" == "$DIST_FINGERPRINT" ]] \
+      && verify_triton_dist_install >/dev/null 2>&1; then
+    echo "Triton-distributed already installed (and importable) for this exact source combo, skipping. FORCE=1 to rebuild."
     echo "(editable install: pure-Python changes take effect without rebuilding)"
 else
     # TRITON_OFFLINE_BUILD=1: setup.py skips ALL downloads (nvidia ptxas/cudart/
     # cupti stubs, prebuilt-LLVM tarballs) and forces TRITON_BUILD_UT=OFF;
     # JSON_SYSPATH satisfies its offline guard; LLVM_SYSPATH points at step 2.
-    # NOTE: pip replaces any preinstalled triton/triton-ascend wheel from the
-    # Docker image; setup.py applies 3rdparty/*.patch (preflighted in step 1).
+    # A preinstalled triton/triton-ascend wheel has to go first: the editable
+    # install only *appends* a meta-path finder, so site-packages would keep
+    # winning and its libtriton.so (no `distributed` plugin) breaks triton_dist
+    # at runtime with "triton._C.libtriton is not a package".
+    purge_shadowing_triton
+    # setup.py applies 3rdparty/*.patch (preflighted in step 1).
     LLVM_SYSPATH="$LLVM_INSTALL_PREFIX" \
     TRITON_BUILD_WITH_CLANG_LLD=ON \
     TRITON_BUILD_PROTON=OFF \
@@ -529,6 +623,8 @@ else
     JSON_SYSPATH="$REPO_DIR/3rdparty/nlohmann-json" \
     TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF" \
     run_pip install -e ./python --verbose --no-build-isolation $PIP_INDEX_FLAGS
+    verify_triton_dist_install \
+        || die "triton does not resolve to this checkout, or its libtriton.so lacks the 'distributed'/'ascend' plugins (see the ERROR above) -- fix the environment, then re-run with FORCE=1"
     echo "$DIST_FINGERPRINT" > "$WORK_ROOT/.stamp_triton_dist"
 fi
 
