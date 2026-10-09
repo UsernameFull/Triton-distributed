@@ -227,6 +227,7 @@ check_vendored() {  # non-zero (and logs [MISSING] lines) if 3rdparty/ is incomp
         3rdparty/llvm-project/lld/CMakeLists.txt \
         3rdparty/triton-ascend/cmake/llvm-hash.txt \
         3rdparty/triton-ascend/third_party/ascend/backend/compiler.py \
+        3rdparty/triton-ascend/third_party/amd/include/TritonAMDGPUToLLVM/TargetUtils.h \
         3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR/CMakeLists.txt \
         3rdparty/AscendNPU-IR/build-tools/build.sh \
         3rdparty/AscendNPU-IR/third-party/llvm-project/llvm/CMakeLists.txt \
@@ -290,23 +291,21 @@ echo "vendored LLVM: $LLVM_SHA (triton-ascend expects $HASH_SHA)"
 [[ "$LLVM_SHA" == "$HASH_SHA" || "$LLVM_SHA" == "unknown" ]] \
     || echo "[WARN] vendored LLVM commit differs from triton-ascend's cmake/llvm-hash.txt"
 
-# setup.py git-applies these two patches during step 4 and HARD-FAILS if they
-# don't apply to a clean tree (dirty trees are skipped). The vendored trees are
-# plain directories of the outer repo now, so setup.py's `git diff-index
-# --quiet HEAD` check spans the WHOLE repo -- mirror it exactly here (cheap)
-# instead of after the ~1h LLVM build.
+# setup.py git-applies these two patches during step 4 whenever they actually
+# apply (it no longer requires a pristine `git diff-index` tree, which plumbing
+# reports as dirty for CRLF/stat-cache noise). Mirror that decision here (cheap)
+# instead of after the ~1h LLVM build, and still hard-fail on a clean tree so a
+# stale/incompatible 3rdparty/*.patch is caught up front.
 preflight_patch() {  # $1=target dir, $2=patch file, $3=label
     local out
-    if git -C "$1" diff-index --quiet HEAD -- 2>/dev/null; then
-        if out=$(git -C "$1" apply --check "$2" 2>&1); then
-            echo "[OK] $3 applies cleanly"
-        else
-            echo "[ERROR] $3 does NOT apply to the vendored tree:" >&2
-            echo "$out" >&2
-            die "$3 incompatible with 3rdparty/triton-ascend -- re-run scripts/vendor_deps.sh or refresh 3rdparty/*.patch"
-        fi
+    if out=$(git -C "$1" apply --check "$2" 2>&1); then
+        echo "[OK] $3 applies cleanly"
     elif git -C "$1" apply --reverse --check "$2" 2>/dev/null; then
         echo "[OK] $3 already applied (re-run with patched tree)"
+    elif git -C "$1" diff-index --quiet HEAD -- 2>/dev/null; then
+        echo "[ERROR] $3 does NOT apply to the clean vendored tree:" >&2
+        echo "$out" >&2
+        die "$3 incompatible with 3rdparty/triton-ascend -- re-run scripts/vendor_deps.sh or refresh 3rdparty/*.patch"
     else
         echo "[WARN] $3 neither applies nor is already applied -- repo has unrelated modifications; setup.py will skip patching it"
     fi

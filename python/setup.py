@@ -107,6 +107,34 @@ class Backend:
     dist_language_dir: Optional[str]
 
 
+def apply_vendored_patch(target_dir, patch_path, label: str):
+    """Apply a vendored git patch under ``target_dir`` unless it is already applied.
+
+    The previous gate used ``git diff-index --quiet HEAD`` -- a plumbing command
+    that reports CRLF/stat-cache noise as modifications -- so any checkout with
+    unrelated local changes (e.g. a Windows CRLF working tree) silently skipped
+    the patch and then failed cryptically deep inside the C++ build (missing
+    headers such as TritonAMDGPUToLLVM/TargetUtils.h).  Mirror the preflight in
+    scripts/build_ascend_a3.sh instead: apply whenever the patch actually
+    applies, skip when it is already applied, and only warn when it conflicts
+    with local edits.
+    """
+
+    def _check(*args):
+        return subprocess.call(["git", "apply", *args], cwd=target_dir,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    name = os.path.basename(str(patch_path))
+    if _check("--check", patch_path) == 0:
+        subprocess.check_call(["git", "apply", patch_path], cwd=target_dir)
+        print(f"[patches] {label}: applied {name}")
+    elif _check("--reverse", "--check", patch_path) == 0:
+        print(f"[patches] {label}: {name} already applied, skipping")
+    else:
+        print(f"[patches][WARN] {label}: {name} neither applies nor is already "
+              f"applied -- leaving the tree unpatched (the build may fail)")
+
+
 class BackendInstaller:
 
     @staticmethod
@@ -131,38 +159,8 @@ class BackendInstaller:
                 npuir_path = TA_dir / "third_party/ascend/AscendNPU-IR"
                 TA_patch = TA_dir / "../triton-ascend.patch"
                 npuir_patch = TA_dir / "../AscendNPU-IR.patch"
-                npuir_dirty = subprocess.call(
-                    [
-                        "git",
-                        "diff-index",
-                        "--quiet",
-                        "HEAD",
-                        "--",
-                    ],
-                    cwd=npuir_path,
-                )
-                TA_dirty = subprocess.call(
-                    [
-                        "git",
-                        "diff-index",
-                        "--quiet",
-                        "HEAD",
-                        "--",
-                    ],
-                    cwd=TA_dir,
-                )
-                if not npuir_dirty:
-                    print("AscendNPU-IR is clean, applying patch...")
-                    try:
-                        subprocess.check_call(["git", "apply", npuir_patch], cwd=npuir_path)
-                    except Exception as e:
-                        raise RuntimeError(f"Failed to apply patch: {e}")
-                if not TA_dirty:
-                    print("AscendNPU-IR is clean, applying patch...")
-                    try:
-                        subprocess.check_call(["git", "apply", TA_patch], cwd=TA_dir)
-                    except Exception as e:
-                        raise RuntimeError(f"Failed to apply patch: {e}")
+                apply_vendored_patch(TA_dir, TA_patch, "triton-ascend")
+                apply_vendored_patch(npuir_path, npuir_patch, "AscendNPU-IR")
 
             backend_src_dir = os.path.join(root_dir, backend_name)
 

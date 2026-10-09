@@ -187,6 +187,9 @@ if(TRITON_USE_ASCEND)
   include_directories(${PROJECT_BINARY_DIR}/3rdparty/triton-ascend/third_party) # Tablegen'd files
   include_directories(${PROJECT_SOURCE_DIR}/3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR/bishengir/include)
   include_directories(${PROJECT_BINARY_DIR}/3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR/bishengir/include) # Tablegen'd files
+  # backend
+  include_directories(${PROJECT_SOURCE_DIR}/3rdparty/triton-ascend/third_party/amd/include)
+  include_directories(${PROJECT_SOURCE_DIR}/3rdparty/triton-ascend/third_party/nvidia/include)
 else()
   include_directories(${PROJECT_SOURCE_DIR}/3rdparty/triton/include)
   include_directories(${PROJECT_BINARY_DIR}/3rdparty/triton/include) # Tablegen'd files
