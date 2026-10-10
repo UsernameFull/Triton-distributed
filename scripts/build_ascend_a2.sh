@@ -124,6 +124,13 @@
 #     AttributeError: 'triton._C.libtriton.ir.builder' object has no attribute
 #                     'create_symm_at'
 # Repair an existing tree (no rebuild) with scripts/repair_ascend_triton_patch.sh.
+# 3rdparty/AscendNPU-IR.patch is checked as well (step 1 + step 3): the pinned
+# AscendNPU-IR predates HIVM's distributed custom-op support, so the patch
+# backports it; without it hivmc rejects every kernel that calls an aclshmem
+# helper with
+#     'hivm.hir.custom' op Unsupported user for root alloc op.
+#     'func.func' op Failed to propagate memory scope for argument #N
+# and that one DOES need a rebuild (step 3) before it takes effect.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -359,22 +366,32 @@ if not hasattr(_distributed_ir, "DistributedOpBuilder"):
     )
 
 triton_pkg = os.path.dirname(os.path.abspath(triton.__file__))
+# setup.py links the ascend backend's sources into
+# <triton>/backends/ascend/ (NOT .../ascend/backend/), so look there first and
+# keep the nested path as a fallback for grafted layouts.
 frontend_needles = (
-    ("compiler/code_generator.py", "distributed.ir.DistributedOpBuilder"),
-    ("compiler/compiler.py", "distributed.ir.load_dialects"),
-    ("backends/ascend/backend/compiler.py", "add_convert_triton_distributed_to_hivm"),
+    (("compiler/code_generator.py",), "distributed.ir.DistributedOpBuilder"),
+    (("compiler/compiler.py",), "distributed.ir.load_dialects"),
+    (("backends/ascend/compiler.py", "backends/ascend/backend/compiler.py"),
+     "add_convert_triton_distributed_to_hivm"),
 )
 unpatched = []
-for rel, needle in frontend_needles:
-    path = os.path.join(triton_pkg, rel)
-    try:
-        with open(path, "rb") as handle:
-            body = handle.read().decode("utf-8", "replace")
-    except OSError as exc:
-        unpatched.append(f"{rel} ({exc})")
+for rel_candidates, needle in frontend_needles:
+    body = None
+    missing = []
+    for rel in rel_candidates:
+        path = os.path.join(triton_pkg, rel)
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read().decode("utf-8", "replace")
+            break
+        except OSError as exc:
+            missing.append(f"{rel} ({exc})")
+    if body is None:
+        unpatched.append("; ".join(missing))
         continue
     if needle not in body:
-        unpatched.append(rel)
+        unpatched.append(rel_candidates[0])
 if unpatched:
     sys.exit(
         "ERROR: the runtime triton tree does NOT carry 3rdparty/triton-ascend.patch:\n"
@@ -642,23 +659,33 @@ preflight_patch "$REPO_DIR/3rdparty/AscendNPU-IR" "$REPO_DIR/3rdparty/AscendNPU-
 # setup.py patches only the INNER AscendNPU-IR copy
 # (3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR), which is what the
 # root CMake build compiles. Step 3 builds hivmc / bishengir-compile from the
-# OUTER 3rdparty/AscendNPU-IR, which must carry the same HIVM op definition
-# (`UnitAttr:$no_side_effect` on `hivm.hir.custom`, emitted by
-# lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp), so
-# apply it here -- again from the repo root with --directory.
+# OUTER 3rdparty/AscendNPU-IR, so that tree has to carry the same changes.
+# 3rdparty/AscendNPU-IR.patch carries two things the distributed flow needs:
+#   * the `no_side_effect` unit attr on `hivm.hir.custom` (HIVMOps.td), set by
+#     lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp;
+#   * HIVM memory-scope support for the distributed custom ops
+#     (InferHIVMMemScope.{h,cpp}, backported from AscendNPU-IR's own
+#     "Add distributed support"). The pinned AscendNPU-IR predates it, and
+#     without it BiShengHIR rejects EVERY kernel that calls an aclshmem helper:
+#       'hivm.hir.custom' op Unsupported user for root alloc op.
+#       'func.func' op Failed to propagate memory scope for argument #N
+# Apply it here -- again from the repo root with --directory.
 apply_outer_npuir_patch() {
     local rel="3rdparty/AscendNPU-IR"
     local td="$REPO_DIR/$rel/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
-    local needle='UnitAttr:$no_side_effect'
-    if grep -qF "$needle" "$td" 2>/dev/null; then
+    local memscope="$REPO_DIR/$rel/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
+    if grep -qF 'UnitAttr:$no_side_effect' "$td" 2>/dev/null \
+       && grep -qF 'inferAndPropagateMemScopeForDistributed' "$memscope" 2>/dev/null; then
         echo "[OK] $rel already carries AscendNPU-IR.patch"
     elif git -C "$REPO_DIR" apply --directory "$rel" "$REPO_DIR/3rdparty/AscendNPU-IR.patch"; then
         echo "[OK] applied 3rdparty/AscendNPU-IR.patch to $rel"
     else
         die "3rdparty/AscendNPU-IR.patch does not apply to $rel -- refresh the patch (see docs/build.md 'Troubleshooting')"
     fi
-    grep -qF "$needle" "$td" \
+    grep -qF 'UnitAttr:$no_side_effect' "$td" \
         || die "AscendNPU-IR.patch did not take effect in $rel (no_side_effect missing from HIVMOps.td)"
+    grep -qF 'inferAndPropagateMemScopeForDistributed' "$memscope" \
+        || die "AscendNPU-IR.patch did not take effect in $rel (distributed HIVM mem-scope support missing from InferHIVMMemScope.cpp -- hivmc would reject every distributed kernel)"
 }
 apply_outer_npuir_patch
 
@@ -725,10 +752,13 @@ banner "step 3: build vendored AscendNPU-IR"
 NPU_SHA="$(vendor_sha "$REPO_DIR/3rdparty/AscendNPU-IR")"
 # The last clause keeps pre-fix build dirs from being reused: they were created
 # without AscendNPU-IR.patch (see apply_outer_npuir_patch), so their hivmc
-# carries no `no_side_effect` on hivm.hir.custom.
+# carries neither `no_side_effect` on hivm.hir.custom nor the distributed
+# mem-scope support.
 NPUIR_TD="$NPU_IR_DIR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
+NPUIR_MEMSCOPE="$NPU_IR_DIR/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
 NPUIR_PATCHED=0
-if grep -qF 'UnitAttr:$no_side_effect' "$NPUIR_TD" 2>/dev/null; then
+if grep -qF 'UnitAttr:$no_side_effect' "$NPUIR_TD" 2>/dev/null \
+   && grep -qF 'inferAndPropagateMemScopeForDistributed' "$NPUIR_MEMSCOPE" 2>/dev/null; then
     NPUIR_PATCHED=1
 fi
 if [[ "$FORCE" != "1" && -f "$WORK_ROOT/.stamp_npu_ir" \

@@ -22,10 +22,12 @@
 # root, with `git apply --directory=<target>` -- and then verifies the result by
 # content instead of by exit status.
 #
-# The affected files are pure Python (plus one CMakeLists include path and one
-# HIVM TableGen op definition), so the distributed frontend works immediately
-# after this script -- no rebuild. Only the C++/tool-side hunks need a rebuild:
-# they take effect the next time `scripts/build_ascend_a3.sh` runs step 3/4.
+# triton-ascend's hunks are pure Python (plus one CMakeLists include path), so
+# the distributed *frontend* works immediately after this script -- no rebuild.
+# The AscendNPU-IR hunks (the HIVM op definition and the distributed HIVM
+# mem-scope support) are compiled into hivmc/bishengir-compile, so they only
+# take effect at the next build:
+#     FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh
 #
 # Usage:
 #   bash scripts/repair_ascend_triton_patch.sh
@@ -44,6 +46,7 @@ OUTER_NPU_DIR="3rdparty/AscendNPU-IR"
 TA_PATCH="$REPO_DIR/3rdparty/triton-ascend.patch"
 NPUIR_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR.patch"
 HIVM_TD="bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
+HIVM_MEMSCOPE="bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 note() { echo "[repair] $*"; }
@@ -89,15 +92,26 @@ verify_contains "$REPO_DIR/$TA_DIR/third_party/ascend/backend/compiler.py" \
     "add_convert_triton_distributed_to_hivm" \
     "the ascend backend runs the distributed->HIVM pass"
 
-# --- 2. AscendNPU-IR: the HIVM CustomOp definition ---------------------------
+# --- 2. AscendNPU-IR: CustomOp attr + distributed HIVM mem-scope support ------
 # setup.py patches the INNER copy (used by the root CMake build); step 3 of
 # scripts/build_ascend_a{2,3}.sh builds hivmc/bishengir-compile from the OUTER
-# copy, so both need the `no_side_effect` unit attr that
-# lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp sets.
+# copy, so both need everything the patch carries:
+#   * the `no_side_effect` unit attr on `hivm.hir.custom`, which
+#     lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp sets;
+#   * HIVM memory-scope support for the distributed custom ops in
+#     InferHIVMMemScope.cpp (backported from AscendNPU-IR's own "Add distributed
+#     support"): the pinned AscendNPU-IR predates it, and without it hivmc
+#     rejects every distributed kernel with
+#       'hivm.hir.custom' op Unsupported user for root alloc op.
+#     Those two hunks are compiled into hivmc/bishengir-compile, so they only
+#     take effect after a rebuild (unlike the Python frontend below).
 for dir in "$INNER_NPU_DIR" "$OUTER_NPU_DIR"; do
     apply_patch "$dir" "$NPUIR_PATCH" "3rdparty/AscendNPU-IR.patch"
     verify_contains "$REPO_DIR/$dir/$HIVM_TD" "UnitAttr:\$no_side_effect" \
         "hivm.hir.custom takes no_side_effect ($dir)"
+    verify_contains "$REPO_DIR/$dir/$HIVM_MEMSCOPE" \
+        "inferAndPropagateMemScopeForDistributed" \
+        "HIVM mem-scope pass handles distributed custom ops ($dir)"
 done
 
 # --- 3. the *runtime* tree, if `triton` is importable here -------------------
@@ -114,19 +128,28 @@ except ImportError as exc:
 pkg = os.path.dirname(os.path.abspath(triton.__file__))
 print(f"[repair] triton {triton.__version__} from {triton.__file__}")
 missing = []
-for rel_name, needle in (
-        ("compiler/code_generator.py", "distributed.ir.DistributedOpBuilder"),
-        ("compiler/compiler.py", "distributed.ir.load_dialects"),
-        ("backends/ascend/backend/compiler.py", "add_convert_triton_distributed_to_hivm")):
-    path = os.path.join(pkg, rel_name)
-    try:
-        with open(path, "rb") as handle:
-            body = handle.read().decode("utf-8", "replace")
-    except OSError as exc:
-        missing.append(f"{rel_name} ({exc})")
+# setup.py links the ascend backend's sources into <triton>/backends/ascend/
+# (NOT .../ascend/backend/), with the nested path kept as a fallback.
+for rel_candidates, needle in (
+        (("compiler/code_generator.py",), "distributed.ir.DistributedOpBuilder"),
+        (("compiler/compiler.py",), "distributed.ir.load_dialects"),
+        (("backends/ascend/compiler.py", "backends/ascend/backend/compiler.py"),
+         "add_convert_triton_distributed_to_hivm")):
+    body = None
+    tried = []
+    for rel_name in rel_candidates:
+        path = os.path.join(pkg, rel_name)
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read().decode("utf-8", "replace")
+            break
+        except OSError as exc:
+            tried.append(f"{rel_name} ({exc})")
+    if body is None:
+        missing.append("; ".join(tried))
         continue
     if needle not in body:
-        missing.append(rel_name)
+        missing.append(rel_candidates[0])
 if missing:
     sys.exit("[repair] ERROR: the runtime triton tree still lacks the frontend patch:\n"
              + "".join(f"           - {name}\n" for name in missing)
@@ -147,15 +170,18 @@ fi
 
 cat <<'EOF'
 
-Done. The Python frontend is patched in place, so no rebuild is needed:
+Done. The Python frontend is patched in place, so no rebuild is needed for it:
 
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
     export PATH=$HOME/ascend-build/AscendNPU-IR/build/bin:$PATH
     torchrun --nproc-per-node=2 --master_port=29501 \
         tutorials/ascend/01-ascend-allgather-gemm.py
 
-The C++/tool-side hunks (the proton CMakeLists include path and the HIVM op
-definition compiled into hivmc) only take effect at the next build:
+If the kernel died inside BiShengHIR
+    'hivm.hir.custom' op Unsupported user for root alloc op.
+the distributed HIVM mem-scope hunk has to be compiled into
+hivmc/bishengir-compile first -- and the other C++/tool-side hunks (the proton
+CMakeLists include path, the HIVM op definition) need a rebuild too:
 
     FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh
 EOF

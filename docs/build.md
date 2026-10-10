@@ -336,3 +336,39 @@ If the ladder blames the compiler layer, capture the MLIR dump for a bug report:
 MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 \
     python3 -m pytest python/triton_dist/test/ascend/test_gm_addr_args_indices.py
 ```
+
+#### Troubleshooting: `'hivm.hir.custom' op Unsupported user for root alloc op.`
+
+The kernel made it through the frontend and the distributed->HIVM pass, then died
+inside `bishengir-compile`'s BiShengHIR pipeline:
+
+```
+error: Failed to run BiShengHIR pipeline
+error: 'func.func' op Failed to propagate memory scope for argument #6
+error: 'hivm.hir.custom' op Unsupported user for root alloc op.
+```
+
+Every aclshmem helper (`dl.symm_at`, `dl.notify`, `libshmem_device.*`) is lowered
+to a `hivm.hir.custom` op marked `hivm.is_distributed`. The vendored AscendNPU-IR
+(triton-ascend's submodule pin, `1b336491`, 2026-04-16) predates HIVM's
+distributed custom-op support (upstream `Ascend/AscendNPU-IR` `fbefed81d`, "Add
+distributed support", 2026-06-05), so its `InferHIVMMemScope` pass saw the custom
+op as an unsupported user of the root alloc and failed the whole pipeline.
+
+`3rdparty/AscendNPU-IR.patch` now backports that support (`no_side_effect` on
+`hivm.hir.custom` plus the distributed branches and
+`inferAndPropagateMemScopeForDistributed` in `InferHIVMMemScope.{h,cpp}`), and
+`scripts/build_ascend_a{2,3}.sh` verify both needles with a rebuild check, so a
+pre-fix build directory is detected. Those hunks are compiled into
+hivmc/bishengir-compile, so **they only take effect after a rebuild**:
+
+```sh
+git pull
+bash scripts/repair_ascend_triton_patch.sh   # applies + verifies the patch (both trees)
+FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh: rebuilds hivmc
+torchrun --nproc-per-node=2 --master_port=29501 tutorials/ascend/01-ascend-allgather-gemm.py
+```
+
+`scripts/probe_ascend_language_api.py` section 6 reports the patch state of both
+vendored trees and of the tree step 3 built from (`$NPU_IR_DIR`, default
+`$HOME/ascend-build/AscendNPU-IR`).

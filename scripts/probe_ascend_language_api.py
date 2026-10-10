@@ -123,20 +123,31 @@ def probe_frontend_patch():
     import triton
 
     pkg = os.path.dirname(os.path.abspath(triton.__file__))
+    # setup.py links the ascend backend's sources into <triton>/backends/ascend/
+    # (NOT .../ascend/backend/), with the nested path kept as a fallback.
     checks = (
-        ("compiler/code_generator.py", "distributed.ir.DistributedOpBuilder"),
-        ("compiler/compiler.py", "distributed.ir.load_dialects"),
-        ("backends/ascend/backend/compiler.py", "add_convert_triton_distributed_to_hivm"),
+        (("compiler/code_generator.py",), "distributed.ir.DistributedOpBuilder"),
+        (("compiler/compiler.py",), "distributed.ir.load_dialects"),
+        (("backends/ascend/compiler.py", "backends/ascend/backend/compiler.py"),
+         "add_convert_triton_distributed_to_hivm"),
     )
-    for rel, needle in checks:
-        path = os.path.join(pkg, rel)
-        try:
-            with open(path, "rb") as handle:
-                body = handle.read().decode("utf-8", "replace")
-        except OSError as exc:
-            report(f"{rel} carries the distributed frontend patch", False, repr(exc))
+    for rel_candidates, needle in checks:
+        body = None
+        tried = []
+        for rel in rel_candidates:
+            path = os.path.join(pkg, rel)
+            try:
+                with open(path, "rb") as handle:
+                    body = handle.read().decode("utf-8", "replace")
+                break
+            except OSError as exc:
+                tried.append(f"{rel} ({exc})")
+        if body is None:
+            report(f"{rel_candidates[0]} carries the distributed frontend patch",
+                   False, "; ".join(tried))
             continue
-        report(f"{rel} carries the distributed frontend patch", needle in body,
+        report(f"{rel_candidates[0]} carries the distributed frontend patch",
+               needle in body,
                "" if needle in body else
                "3rdparty/triton-ascend.patch is not applied -- fix: "
                "bash scripts/repair_ascend_triton_patch.sh")
@@ -256,6 +267,7 @@ def main():
     probe_symbols()
     probe_signatures()
     probe_smoke_compile()
+    probe_npu_ir_patch()
 
     print()
     print("=" * 72)
@@ -277,6 +289,58 @@ def main():
         print("If the sem/scope smoke test passed, consider setting")
         print("_MEM_ORDER_PASSTHROUGH = True in")
         print("python/triton_dist/language/extra/ascend/language_extra.py")
+
+
+def probe_npu_ir_patch():
+    """The vendored AscendNPU-IR trees must carry ``AscendNPU-IR.patch``.
+
+    The pinned AscendNPU-IR (triton-ascend's submodule pin, 1b336491) predates
+    HIVM's distributed custom-op support, so the patch backports two things:
+
+      * ``no_side_effect`` on ``hivm.hir.custom`` (HIVMOps.td), set by
+        ``lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp``;
+      * memory-scope support for the distributed custom ops
+        (``InferHIVMMemScope.{h,cpp}``).
+
+    Both are compiled into hivmc/bishengir-compile, so they only take effect
+    after a rebuild. Missing them makes BiShengHIR reject every kernel that
+    calls an aclshmem helper with
+
+      'hivm.hir.custom' op Unsupported user for root alloc op.
+      'func.func' op Failed to propagate memory scope for argument #N
+    """
+    print()
+    print("=" * 72)
+    print("6. Vendored AscendNPU-IR patch (C++/hivmc side, needs a rebuild)")
+    print("=" * 72)
+    repo = os.environ.get("REPO_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    built_tree = os.environ.get("NPU_IR_DIR") or os.path.expanduser("~/ascend-build/AscendNPU-IR")
+    checks = (
+        ("bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td",
+         "UnitAttr:$no_side_effect"),
+        ("bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp",
+         "inferAndPropagateMemScopeForDistributed"),
+    )
+    trees = (
+        "3rdparty/AscendNPU-IR",
+        "3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR",
+        built_tree,
+    )
+    for tree in trees:
+        label = tree if os.path.isabs(tree) else tree
+        for rel, needle in checks:
+            path = os.path.join(tree if os.path.isabs(tree) else os.path.join(repo, tree), rel)
+            try:
+                with open(path, "rb") as handle:
+                    body = handle.read().decode("utf-8", "replace")
+            except OSError as exc:
+                report(f"{label}: {os.path.basename(rel)} carries the patch", False, repr(exc))
+                continue
+            report(f"{label}: {os.path.basename(rel)} carries the patch", needle in body,
+                   "" if needle in body else
+                   "3rdparty/AscendNPU-IR.patch is not applied -- fix: "
+                   "bash scripts/repair_ascend_triton_patch.sh, then rebuild with "
+                   "FORCE=1 bash scripts/build_ascend_a3.sh (or build_ascend_a2.sh)")
 
 
 if __name__ == "__main__":

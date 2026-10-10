@@ -166,7 +166,7 @@ def apply_vendored_patch(target_dir, patch_path, label: str, required=()):
                 f"[patches] {label}: {rel_file} does not contain {needle!r} after "
                 f"applying {name} -- the patch did not take effect (a `git apply` run "
                 f"from the wrong directory prints \"Skipped patch\" and exits 0). "
-                f"Refusing to build a libtriton without the distributed frontend; repair "
+                f"Refusing to build a tree without the vendored distributed support; repair "
                 f"with `scripts/repair_ascend_triton_patch.sh` (Ascend) and re-run.")
         print(f"[patches] {label}: verified {rel_file} carries {needle!r}")
 
@@ -209,6 +209,15 @@ class BackendInstaller:
                 apply_vendored_patch(npuir_path, npuir_patch, "AscendNPU-IR", required=(
                     ("bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td",
                      "UnitAttr:$no_side_effect"),
+                    # The HIVM mem-scope pass has to know the distributed
+                    # custom ops the distributed->HIVM pass emits
+                    # (`hivm.hir.custom` + `hivm.is_distributed`); the pinned
+                    # AscendNPU-IR predates that, so the patch backports it.
+                    # Without it hivmc rejects every kernel that calls an
+                    # aclshmem helper with
+                    #   'hivm.hir.custom' op Unsupported user for root alloc op.
+                    ("bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp",
+                     "inferAndPropagateMemScopeForDistributed"),
                 ))
 
             backend_src_dir = os.path.join(root_dir, backend_name)
