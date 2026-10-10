@@ -228,6 +228,31 @@ purge_shadowing_triton() {
     done < <(python3 -c 'import site; [print(p) for p in dict.fromkeys([*site.getsitepackages(), site.getusersitepackages()]) if p]' 2>/dev/null || true)
 }
 
+# Editable install of THIS checkout through the same interpreter used for every
+# later `python3` check. `env` supplies the build-time variables so the helper
+# is independent of the caller's shell variables. FORCE_PY3_PIP=1 bypasses any
+# PIP_BIN override and goes straight through `python3 -m pip`.
+install_editable_triton_dist() {
+    local pip_cmd
+    if [[ "${FORCE_PY3_PIP:-0}" == "1" || -z "${PIP_BIN:-}" ]]; then
+        pip_cmd="python3 -m pip"
+    else
+        pip_cmd="$PIP_BIN"
+    fi
+    echo "[triton] editable install via: $pip_cmd"
+    # shellcheck disable=SC2086
+    env \
+        LLVM_SYSPATH="$LLVM_INSTALL_PREFIX" \
+        TRITON_BUILD_WITH_CLANG_LLD=ON \
+        TRITON_BUILD_PROTON=OFF \
+        TRITON_BUILD_LITTLE_KERNEL=OFF \
+        TRITON_USE_ASCEND=ON \
+        TRITON_OFFLINE_BUILD=1 \
+        JSON_SYSPATH="$REPO_DIR/3rdparty/nlohmann-json" \
+        TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF" \
+        $pip_cmd install -e ./python --verbose --no-build-isolation $PIP_INDEX_FLAGS
+}
+
 # Hard-verify that `import triton` resolves to THIS checkout and that the loaded
 # libtriton.so really carries the `distributed` (and `ascend`) plugins. Without
 # this the shadowing above only surfaces as a confusing error deep inside
@@ -238,7 +263,49 @@ import os
 import sys
 
 repo = os.path.realpath(os.environ["TRITON_DIST_REPO_DIR"])
-import triton  # must already resolve to this checkout
+print(f"[triton] python {sys.version.split()[0]} ({sys.executable})")
+
+try:
+    import triton  # must already resolve to this checkout
+except ImportError as exc:
+    # Almost always: pip installed into a different interpreter, or a previous
+    # purge removed the (image) triton and the editable install never landed.
+    import glob
+    import site
+    import subprocess
+
+    print(f"[triton] FATAL: import triton failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+    print(f"[triton]   interpreter    : {sys.executable}", file=sys.stderr)
+    print(f"[triton]   repo (expected): {repo}", file=sys.stderr)
+    for p in sys.path:
+        print(f"[triton]   sys.path       : {p}", file=sys.stderr)
+    for d in dict.fromkeys([*site.getsitepackages(), site.getusersitepackages()]):
+        if not d or not os.path.isdir(d):
+            continue
+        print(f"[triton]   site-packages  : {d}", file=sys.stderr)
+        for pat in ("__editable__*triton*", "__editable___triton*"):
+            for f in glob.glob(os.path.join(d, pat)):
+                print(f"[triton]     editable finder: {f}", file=sys.stderr)
+    for mod in ("triton-dist", "triton", "triton-ascend"):
+        try:
+            out = subprocess.run([sys.executable, "-m", "pip", "show", mod],
+                                 capture_output=True, text=True, timeout=120)
+        except Exception as sub_exc:  # noqa: BLE001
+            print(f"[triton]   pip show {mod}: {sub_exc}", file=sys.stderr)
+            continue
+        state = "installed" if out.returncode == 0 else "NOT installed"
+        print(f"[triton]   pip show {mod}: {state}", file=sys.stderr)
+        body = (out.stdout or out.stderr).strip()
+        if body:
+            for line in body.splitlines():
+                print(f"[triton]     {line}", file=sys.stderr)
+    sys.exit(
+        "ERROR: 'triton' is not importable by this interpreter at all.\n"
+        "       Step 4 ran pip, but the editable install does not provide\n"
+        "       'triton' here -- pip targeted a different python, or the install\n"
+        "       silently no-op'd. Re-run with FORCE=1 and check the diagnostics\n"
+        "       above (interpreter / site-packages / pip show)."
+    )
 
 where = os.path.realpath(triton.__file__)
 print(f"[triton] triton {triton.__version__} from {triton.__file__}")
@@ -302,12 +369,25 @@ for tool in git python3; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not installed"
 done
 
-# pip is either a binary (pip/pip3) or reachable as `python3 -m pip`.
-PIP_BIN=$(command -v pip || command -v pip3 || true)
-if [[ -z "$PIP_BIN" ]]; then
-    python3 -m pip --version >/dev/null 2>&1 \
-        || die "no pip available (tried pip, pip3, python3 -m pip)"
+# Always drive pip through `python3 -m pip`. A bare `pip`/`pip3` binary can
+# belong to a DIFFERENT interpreter (conda vs system, /usr/bin vs /usr/local),
+# in which case step 4 "Successfully installed"s into that other environment
+# and the very next `python3` call dies with
+#     ModuleNotFoundError: No module named 'triton'
+# PIP_BIN is honored only when it provably belongs to the same interpreter.
+PY3_REAL="$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || true)"
+[[ -n "$PY3_REAL" ]] || PY3_REAL="$(command -v python3)"
+PIP_BIN="${PIP_BIN:-$(command -v pip || command -v pip3 || true)}"
+if [[ -n "$PIP_BIN" ]]; then
+    _pip_py="$("$PIP_BIN" -c 'import sys; print(sys.executable)' 2>/dev/null || true)"
+    if [[ "$_pip_py" != "$PY3_REAL" ]]; then
+        echo "[deps] ignoring PIP_BIN=$PIP_BIN (python: ${_pip_py:-unknown}); using 'python3 -m pip'"
+        PIP_BIN=""
+    fi
 fi
+python3 -m pip --version >/dev/null 2>&1 \
+    || die "no pip available for $PY3_REAL (tried pip, pip3, python3 -m pip)"
+echo "[deps] python3: $PY3_REAL | pip: $(python3 -m pip --version 2>/dev/null)"
 
 # Build tooling: auto-install ONLY what is missing (or too old), from the
 # mirror. AUTO_INSTALL_DEPS=1 by default; 0 = strict offline check-and-die.
@@ -614,15 +694,16 @@ else
     # at runtime with "triton._C.libtriton is not a package".
     purge_shadowing_triton
     # setup.py applies 3rdparty/*.patch (preflighted in step 1).
-    LLVM_SYSPATH="$LLVM_INSTALL_PREFIX" \
-    TRITON_BUILD_WITH_CLANG_LLD=ON \
-    TRITON_BUILD_PROTON=OFF \
-    TRITON_BUILD_LITTLE_KERNEL=OFF \
-    TRITON_USE_ASCEND=ON \
-    TRITON_OFFLINE_BUILD=1 \
-    JSON_SYSPATH="$REPO_DIR/3rdparty/nlohmann-json" \
-    TRITON_APPEND_CMAKE_ARGS="-DTRITON_BUILD_UT=OFF" \
-    run_pip install -e ./python --verbose --no-build-isolation $PIP_INDEX_FLAGS
+    install_editable_triton_dist \
+        || die "editable install of ./python failed (see the pip output above)"
+    # 'Successfully installed' from pip is not enough: if pip targeted another
+    # interpreter, `import triton` here is a bare ModuleNotFoundError. Retry
+    # once, explicitly through python3, before the detailed verify below.
+    if ! python3 -c 'import triton' >/dev/null 2>&1; then
+        echo "[triton] 'import triton' failed right after the install -- retrying via 'python3 -m pip'"
+        FORCE_PY3_PIP=1 install_editable_triton_dist \
+            || die "editable reinstall via 'python3 -m pip' failed (see the pip output above)"
+    fi
     verify_triton_dist_install \
         || die "triton does not resolve to this checkout, or its libtriton.so lacks the 'distributed'/'ascend' plugins (see the ERROR above) -- fix the environment, then re-run with FORCE=1"
     echo "$DIST_FINGERPRINT" > "$WORK_ROOT/.stamp_triton_dist"
