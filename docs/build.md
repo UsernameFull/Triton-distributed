@@ -278,8 +278,12 @@ causes of `-11`:
   `AscendNPU-IR/build-tools/build.sh` runs with `-t`
   (`BISHENGIR_BUILD_TEMPLATE=ON`), which needs CANN's
   `$ASCEND_HOME_PATH/bin/{ccec,llvm-link}`. The build scripts pass `-t` and
-  hard-verify the bitcode; if you built `AscendNPU-IR` by hand, rebuild it with
-  `-t`;
+  hard-verify the bitcode. To repair an existing tree run
+  `bash scripts/repair_ascend_npu_ir_template.sh`; a plain `build.sh ... -t`
+  re-run is NOT enough, because `build.sh` skips CMake whenever
+  `build/CMakeCache.txt` exists, so the cached
+  `-DBISHENGIR_BUILD_TEMPLATE=OFF` wins (the repair script drops just the cache
+  and re-configures, keeping the object files);
 * **`triton` / `shmem` resolving to a preinstalled package** in `site-packages`
   instead of this checkout -- `scripts/build_ascend_a3.sh` purges shadowing
   installs and verifies the resolved `libtriton`, and the triage log prints the
