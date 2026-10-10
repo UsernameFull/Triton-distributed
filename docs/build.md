@@ -284,6 +284,12 @@ causes of `-11`:
   `build/CMakeCache.txt` exists, so the cached
   `-DBISHENGIR_BUILD_TEMPLATE=OFF` wins (the repair script drops just the cache
   and re-configures, keeping the object files);
+* **`torchrun` dies with `EADDRINUSE`, `port: 29500`** -- a previous run's
+  torchrun/TCPStore (or a pytest `-m dist` run, which also defaults to 29500) is
+  still holding the rendezvous port. Kill it (`pkill -f torchrun`,
+  `pkill -f 01-ascend-allgather-gemm`) and/or pick another port:
+  `torchrun --nproc-per-node=2 --master_port=29501 tutorials/ascend/01-ascend-allgather-gemm.py`
+  (`scripts/triage_ascend_runtime.sh` honours `MASTER_PORT`);
 * **`triton` / `shmem` resolving to a preinstalled package** in `site-packages`
   instead of this checkout -- `scripts/build_ascend_a3.sh` purges shadowing
   installs and verifies the resolved `libtriton`, and the triage log prints the

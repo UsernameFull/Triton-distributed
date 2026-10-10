@@ -28,6 +28,8 @@
 #   WORK_ROOT    [$HOME/ascend-build]        logs go to $WORK_ROOT/triage-logs
 #   TUTORIAL     [tutorials/ascend/01-ascend-allgather-gemm.py]
 #   WORLD        [2]                         ranks for the tutorial stage
+#   MASTER_PORT  [29500]   torchrun rendezvous port; change it if a stale
+#                          torchrun/TCPStore still holds 29500 (EADDRINUSE)
 #   RUN_TUTORIAL [1]
 #   STOP_ON_FAIL [1]
 #   PYTEST_EXTRA [-x -q]
@@ -41,6 +43,7 @@ CANN_ENV="${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}"
 WORK_ROOT="${WORK_ROOT:-$HOME/ascend-build}"
 TUTORIAL="${TUTORIAL:-tutorials/ascend/01-ascend-allgather-gemm.py}"
 WORLD="${WORLD:-2}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 RUN_TUTORIAL="${RUN_TUTORIAL:-1}"
 STOP_ON_FAIL="${STOP_ON_FAIL:-1}"
 PYTEST_EXTRA="${PYTEST_EXTRA:--x -q}"
@@ -184,7 +187,8 @@ if [[ "$RUN_TUTORIAL" == "1" && ( ${#FAILED[@]} -eq 0 || "$STOP_ON_FAIL" != "1" 
     export TRITON_ALWAYS_COMPILE=1
     if command -v torchrun >/dev/null 2>&1; then
         run_stage "tutorial $TUTORIAL ($WORLD ranks)" \
-            torchrun --nproc-per-node="$WORLD" "$TUTORIAL" || true
+            torchrun --nproc-per-node="$WORLD" --master_port="$MASTER_PORT" \
+                "$TUTORIAL" || true
     else
         say "torchrun not found -- skipping the tutorial stage"
     fi
@@ -215,7 +219,8 @@ Next steps:
   * only 'tutorial' failed      -> the ladder works, so the tutorial's own kernel
                                    is the trigger; re-run it with the Triton dump:
                                      MLIR_ENABLE_DUMP=1 TRITON_ALWAYS_COMPILE=1 \\
-                                       torchrun --nproc-per-node=$WORLD $TUTORIAL
+                                       torchrun --nproc-per-node=$WORLD \
+                                         --master_port=$MASTER_PORT $TUTORIAL
   * anything fails with SIGSEGV -> also try a clean Triton cache:
                                      CLEAR_CACHE=1 bash scripts/triage_ascend_runtime.sh
 
