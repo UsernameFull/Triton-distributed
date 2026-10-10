@@ -1,0 +1,449 @@
+diff --git a/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td b/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td
+index bd750357d..8fabe0c8c 100644
+--- a/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td
++++ b/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMAttrs.td
+@@ -1192,4 +1192,14 @@ def HIVM_PreloadLocalBufferAttr
+   }];
+ }
+ 
++//===----------------------------------------------------------------------===//
++// Distributed
++//===----------------------------------------------------------------------===//
++
++def HIVM_IsDistributedAttr : HIVM_Attr<"IsDistributed", "is_distributed"> {
++  let description = [{
++    Specifies an op is about distributed.
++  }];
++}
++
+ #endif // BISHENGIR_DIALECT_HIVM_IR_HIVMATTRS_TD
+diff --git a/bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h b/bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h
+new file mode 100644
+index 000000000..f23add10b
+--- /dev/null
++++ b/bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h
+@@ -0,0 +1,35 @@
++//===- DistributedTransformUtils.h - Utilities for Distributed HIVM Ops ---===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef BISHENGIR_DIALECT_HIVM_DISTRIBUTED_TRANSFORM_UTILS_H
++#define BISHENGIR_DIALECT_HIVM_DISTRIBUTED_TRANSFORM_UTILS_H
++
++#include "bishengir/Dialect/HIVM/IR/HIVM.h"
++#include "llvm/ADT/StringSet.h"
++#include <string>
++
++namespace mlir {
++namespace hivm {
++
++// HIVM Distributed CustomOp Types
++const StringSet<> shmemIntp = {"dist.aclshmem_int64_p", "dist.aclshmem_int32_p",
++                               "dist.aclshmem_int16_p", "dist.aclshmem_int8_p"};
++
++const std::string kShmemPtr = "aclshmem_ptr";
++const std::string kShmemConsumeToken = "aclshmem_consume_token";
++
++// Helper Functions
++inline bool isDistributedTypeCustomOp(Operation *op) {
++  return op->hasAttr(hivm::IsDistributedAttr::name) &&
++         llvm::isa<hivm::CustomOp>(op);
++}
++
++} // namespace hivm
++} // namespace mlir
++
++#endif // BISHENGIR_DIALECT_HIVM_DISTRIBUTED_TRANSFORM_UTILS_H
+diff --git a/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMDataLayout.h b/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMDataLayout.h
+index 87de3384f..1d2e14f49 100644
+--- a/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMDataLayout.h
++++ b/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMDataLayout.h
+@@ -91,6 +91,17 @@ private:
+   /// is different than before.
+   bool updateLayoutIfChanged(Value value, const LayoutInfo &info);
+ 
++  /// Populate the layout info for all the values.
++  void populateLayout(ValueRange values, const LayoutInfo &info,
++                      SmallVector<Value> &changed);
++  /// Populate the layout info for hivm.custom results.
++  void populateLayoutToHIVMCustom(hivm::CustomOp op,
++                                  SmallVector<Value> &changed);
++  /// Populate the layout info for the input value if it is absent. Return true
++  /// if the layout was populated, false if the value already had layout
++  /// information and was not modified.
++  bool populateLayoutIfAbsent(Value value, const LayoutInfo &info);
++
+   /// Check whether the layout conversion is supported.
+   bool isConversionValid(const LayoutInfo &info);
+ 
+diff --git a/bishengir/lib/Dialect/HIVM/IR/InferCoreTypeInterface/InferCoreType.cpp b/bishengir/lib/Dialect/HIVM/IR/InferCoreTypeInterface/InferCoreType.cpp
+index d82719315..f168db007 100644
+--- a/bishengir/lib/Dialect/HIVM/IR/InferCoreTypeInterface/InferCoreType.cpp
++++ b/bishengir/lib/Dialect/HIVM/IR/InferCoreTypeInterface/InferCoreType.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
++#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+ #include "bishengir/Dialect/Utils/Util.h"
+ #include "mlir/Dialect/Func/IR/FuncOps.h"
+ #include "llvm/ADT/DenseSet.h"
+@@ -118,7 +119,47 @@ inferCoreTypeForGlobalMixMatmulOps(GlobalMixMatmulTy *mixMatmulOp) {
+ // HIVM Ops
+ //===----------------------------------------------------------------------===//
+ 
++// Helper to get preCoreType by walking func body in pre-order
++static TCoreType getPreCoreTypeForNotifyOp(Operation *notifyOp) {
++  TCoreType preCoreType = TCoreType::VECTOR;
++  func::FuncOp funcOp = notifyOp->getParentOfType<func::FuncOp>();
++  if (!funcOp) {
++    return preCoreType;
++  }
++
++  funcOp.walk([&](Operation *op) {
++    if (op == notifyOp) {
++      return WalkResult::interrupt();
++    }
++    if (auto customOp = dyn_cast<hivm::CustomOp>(op)) {
++      if (shmemIntp.contains(customOp.getName())) {
++        // Skip other notify ops
++        return WalkResult::advance();
++      }
++    }
++    // Update preCoreType based on current op
++    std::optional<TCoreType> tmpCoreType =
++        hivm::detail::queryCoreTypeHelper(op);
++    if (tmpCoreType != std::nullopt &&
++        tmpCoreType != TCoreType::CUBE_AND_VECTOR &&
++        tmpCoreType != TCoreType::CUBE_OR_VECTOR) {
++      preCoreType = tmpCoreType.value();
++    }
++    return WalkResult::advance();
++  });
++  return preCoreType;
++}
++
+ std::optional<TCoreType> CustomOp::inferCoreType() {
++  // Handle shmemIntp notify ops: infer coreType based on preceding ops
++  if (shmemIntp.contains(this->getName())) {
++    TCoreType preCoreType = getPreCoreTypeForNotifyOp(getOperation());
++    if (preCoreType == TCoreType::CUBE_OR_VECTOR) {
++      // If no preceding CUBE/VECTOR ops, default to VECTOR
++      return TCoreType::VECTOR;
++    }
++    return preCoreType;
++  }
+   if (auto coreTypeAttr = getOperation()->template getAttrOfType<TCoreTypeAttr>(
+           TCoreTypeAttr::name)) {
+     return coreTypeAttr.getTcoretype();
+diff --git a/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp b/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp
+index e16cd6dea..81eac922a 100644
+--- a/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp
++++ b/bishengir/lib/Dialect/HIVM/IR/LibraryFunctionOpInterface/LibraryFunctionOpInterfaceImpl.cpp
+@@ -6,10 +6,12 @@
+ //
+ //===----------------------------------------------------------------------===//
+ 
+-#include "bishengir/Dialect/HIVM/IR/HIVMDialectExtension.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+-#include "bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.h"
++#include "bishengir/Dialect/HIVM/IR/HIVMDialectExtension.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
++#include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
++#include "bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.h"
++#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+ #include "bishengir/Dialect/HIVM/Utils/Utils.h"
+ #include "bishengir/Dialect/Utils/Util.h"
+ 
+@@ -18,8 +20,10 @@
+ #include "mlir/IR/TypeUtilities.h"
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallVector.h"
++#include "llvm/Support/Casting.h"
+ #include "llvm/Support/FormatVariadic.h"
+ #include <algorithm>
++#include <string>
+ 
+ #include "bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.cpp.inc"
+ 
+@@ -240,7 +244,7 @@ std::string getNZ2NDOpLibraryCallName(NZ2NDOp concreteOp,
+          "_" + dataTypeStr;
+ }
+ 
+-std::string debugCallNameMangleSuffix(Operation *op) {
++std::string callNameMangleSuffix(Operation *op) {
+   std::string suffix = "";
+   ModuleOp moduleOp = op->getParentOfType<ModuleOp>();
+   if (!moduleOp) {
+@@ -337,7 +341,7 @@ std::string getDebugOpLibraryCallName(DebugOp concreteOp,
+     callName += "_gm"; // currently, scalar can choose either gm or ubuf since
+                        // they currently call the same core
+   }
+-  return callName + debugCallNameMangleSuffix(concreteOp.getOperation());
++  return callName + callNameMangleSuffix(concreteOp.getOperation());
+ }
+ 
+ void updateStringStreamForMixMatmulOp(std::stringstream &ss,
+@@ -799,7 +803,7 @@ std::string InferMaxRankExternalModel<VDeinterleaveOp>::getOpLibraryCallName(
+ template <>
+ std::string NoMaxRankExternalModel<FinishDebugOp>::getOpLibraryCallName(
+     Operation *op, std::optional<bool> isOpsAligned) const {
+-  return "_mlir_ciface_finish_debug" + debugCallNameMangleSuffix(op);
++  return "_mlir_ciface_finish_debug" + callNameMangleSuffix(op);
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -835,7 +839,7 @@ std::string NoMaxRankExternalModel<FixpipeOp>::getOpLibraryCallName(
+ template <>
+ std::string NoMaxRankExternalModel<InitDebugOp>::getOpLibraryCallName(
+     Operation *op, std::optional<bool> isOpsAligned) const {
+-  return "_mlir_ciface_init_debug" + debugCallNameMangleSuffix(op);
++  return "_mlir_ciface_init_debug" + callNameMangleSuffix(op);
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -1086,7 +1090,22 @@ std::string InferMaxRankExternalModel<CustomOp>::getOpLibraryCallName(
+     return inferBuiltinCallName(isOpsAligned);
+   }
+ 
+-  return concreteOp.getSymbol();
++  // add _mlir_ciface_ prefix if no memref in op's operands and values
++  auto hasMemrefInArgOrRet = [&concreteOp]() {
++    auto isMemref = [](Value v) {
++      return ::llvm::isa<::mlir::BaseMemRefType>(v.getType());
++    };
++    if (::llvm::any_of(concreteOp->getOperands(), isMemref))
++      return true;
++    if (::llvm::any_of(concreteOp.getResults(), isMemref))
++      return true;
++    return false;
++  };
++  std::string prefix = concreteOp.getSymbol();
++  if (!hasMemrefInArgOrRet()) {
++    prefix = "_mlir_ciface_" + prefix;
++  }
++  return prefix + callNameMangleSuffix(op);
+ }
+ 
+ #define REGISTER_STATIC_MAX_RANK(OP, MAX_RANK)                                 \
+diff --git a/bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp b/bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp
+index 2d304a49a..59e54764d 100644
+--- a/bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp
++++ b/bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp
+@@ -19,6 +19,7 @@
+ #include "bishengir/Dialect/HACC/IR/HACC.h"
+ #include "bishengir/Dialect/HACC/Utils/Utils.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVM.h"
++#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+ #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+ #include "bishengir/Dialect/HIVM/Utils/Utils.h"
+ #include "bishengir/Dialect/Utils/Util.h"
+@@ -50,6 +51,16 @@ namespace {
+ // Patterns that convert ops from other dialects to HIVM ops.
+ //===---------------------------------------------------------------------===//
+ 
++inline bool isFromDistCallResult(mlir::Value v) {
++  auto *srcOp = utils::tracebackMemRef(v).getDefiningOp();
++  if (!srcOp)
++    return false;
++  if (hivm::isDistributedTypeCustomOp(srcOp)) {
++    return true;
++  }
++  return false;
++}
++
+ std::optional<Value>
+ getPadValueForSingleValue(std::optional<Operation *> allocOpAlias) {
+   if (!allocOpAlias.has_value())
+@@ -236,19 +247,24 @@ struct MemrefCopyOpLowering : public OpRewritePattern<memref::CopyOp> {
+   LogicalResult matchAndRewrite(memref::CopyOp copyOp,
+                                 PatternRewriter &rewriter) const override {
+     Value src = copyOp.getSource();
+-    bool convertToLoad = isFromGMSpace(src);
++    // TODO：remove memref.copy conversion after changing to use
++    // hivm.load/hivm.store directly
++    bool convertToLoad = isFromGMSpace(src) || isFromDistCallResult(src);
+     if (convertToLoad) {
+       return replaceMemCopyByHIVMLoadOp(copyOp, rewriter);
+     }
+ 
+     Value dst = copyOp.getTarget();
+-    bool convertToStore = isFromGMSpace(dst);
++    // TODO：remove memref.copy conversion after changing to use
++    // hivm.load/hivm.store directly
++    bool convertToStore = isFromGMSpace(dst) || isFromDistCallResult(dst);
++
+     if (convertToStore) {
+       auto storeOp = rewriter.replaceOpWithNewOp<hivm::StoreOp>(
+           copyOp, TypeRange(), src, dst);
+       // TODO: change TA to create hivm.load/store op directly
+       auto implicitTransposeAttr = utils::getAnnotateOpWithAttr(
+-          copyOp.getTarget(), "MayImplicitTransposeWithLastAxis");
++          dst, "MayImplicitTransposeWithLastAxis");
+       if (implicitTransposeAttr.has_value()) {
+         storeOp.setMayImplicitTransposeWithLastAxis(true);
+       }
+@@ -269,7 +285,9 @@ struct BufferizeMaterializeOpLowering
+   matchAndRewrite(bufferization::MaterializeInDestinationOp bufMIDOp,
+                   PatternRewriter &rewriter) const override {
+     Value dst = bufMIDOp.getDest();
+-    bool convertToStore = isFromGMSpace(dst);
++    // TODO：remove bufferization conversion after changing to use
++    // hivm.load/hivm.store directly
++    bool convertToStore = isFromGMSpace(dst) || isFromDistCallResult(dst);
+     if (convertToStore) {
+       rewriter.replaceOpWithNewOp<hivm::StoreOp>(bufMIDOp, TypeRange(),
+                                                  bufMIDOp.getSource(), dst);
+diff --git a/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMDataLayout.cpp b/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMDataLayout.cpp
+index 8bda4f93d..9bfff5a4f 100644
+--- a/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMDataLayout.cpp
++++ b/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMDataLayout.cpp
+@@ -15,9 +15,11 @@
+ //
+ //===----------------------------------------------------------------------===//
+ #include "bishengir/Dialect/HIVM/Transforms/InferHIVMDataLayout.h"
++#include "bishengir/Dialect/Annotation/IR/Annotation.h"
+ #include "bishengir/Dialect/HACC/Utils/Utils.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
++#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+ #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+ #include "bishengir/Dialect/HIVM/Utils/Utils.h"
+ #include "bishengir/Dialect/MemRefExt/IR/MemRefExt.h"
+@@ -40,8 +42,10 @@
+ #include "mlir/Pass/Pass.h"
+ #include "mlir/Support/LLVM.h"
+ 
++#include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/SmallVectorExtras.h"
++#include "llvm/ADT/StringRef.h"
+ #include "llvm/ADT/TypeSwitch.h"
+ #include "llvm/Support/Casting.h"
+ #include "llvm/Support/ErrorHandling.h"
+@@ -593,6 +597,9 @@ DataLayoutInferAndPropagateHelper::propagateDataLayoutToUsers(
+             [&](bishengir::memref_ext::AllocWorkspaceOp op) {
+               updateLayout(op->getResults(), info, changed);
+             })
++        // TODO: adapt custom op's infer data layout in V2
++        .Case<hivm::CustomOp>(
++            [&](hivm::CustomOp op) { populateLayoutToHIVMCustom(op, changed); })
+         .Default([&](Operation *op) {
+           // Don't need to update Ops that don't have results.
+           if (op->getNumResults() == 0)
+@@ -638,6 +645,56 @@ void DataLayoutInferAndPropagateHelper::updateLayout(
+   }
+ }
+ 
++/// Populates the layout information for a value if it is absent.
++/// @param value The value to populate layout for.
++/// @param info The layout information to insert.
++/// @return True if the layout was populated, false if the value already had
++/// layout information and was not modified.
++bool DataLayoutInferAndPropagateHelper::populateLayoutIfAbsent(
++    Value value, const LayoutInfo &info) {
++
++  if (layout_info_.contains(value)) {
++    LDBG("Not populating, layout_info_ for " << value << " already exists");
++    return false;
++  }
++
++  layout_info_[value] = info;
++  LLVM_DEBUG(llvm::dbgs() << "  [Init] Value [" << value
++                          << "] Current layout is: " << info.currentLayout
++                          << ", Target layout is: " << info.targetLayout
++                          << "\n";);
++  return true;
++}
++
++void DataLayoutInferAndPropagateHelper::populateLayout(
++    ValueRange values, const LayoutInfo &info, SmallVector<Value> &changed) {
++
++  for (Value value : values) {
++    if (!isa<BaseMemRefType>(value.getType()))
++      continue;
++    if (populateLayoutIfAbsent(value, info))
++      changed.push_back(value);
++  }
++}
++
++void DataLayoutInferAndPropagateHelper::populateLayoutToHIVMCustom(
++    hivm::CustomOp op, SmallVector<Value> &changed) {
++  if (!llvm::any_of(op->getResultTypes(), [](Type v) {
++        return ::llvm::isa<::mlir::BaseMemRefType>(v);
++      })) {
++    return;
++  }
++  auto results = op->getResults();
++  auto symbol = op.getSymbol();
++  llvm::StringRef symbolRef = symbol;
++  if (symbolRef.starts_with(kShmemConsumeToken) ||
++      symbolRef.starts_with(kShmemPtr)) {
++    updateLayout(results, layout_info_[op->getOperand(0)], changed);
++  } else {
++    op->emitWarning("unsupport hivm.custom symbol for infer results layout");
++  }
++}
++
+ //===----------------------------------------------------------------------===//
+ // Resolve Conflicts
+ //===----------------------------------------------------------------------===//
+diff --git a/bishengir/lib/Dialect/HIVM/Transforms/SplitMixKernel.cpp b/bishengir/lib/Dialect/HIVM/Transforms/SplitMixKernel.cpp
+index da9291905..80552e8cc 100644
+--- a/bishengir/lib/Dialect/HIVM/Transforms/SplitMixKernel.cpp
++++ b/bishengir/lib/Dialect/HIVM/Transforms/SplitMixKernel.cpp
+@@ -19,6 +19,7 @@
+ #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
+ #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
++#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+ #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
+ #include "bishengir/Dialect/HIVM/Utils/Utils.h"
+ #include "bishengir/Dialect/Scope/IR/Scope.h"
+@@ -327,6 +328,29 @@ static bool isLoopOfCoreType(scf::ForOp forOp, TCoreType coreType) {
+          coreType == inferredCoreType.value();
+ }
+ 
++static void inferDistributedCoreType(func::FuncOp mixedFunc) {
++  auto rectifyCoreType = [mixedFunc](hivm::TCoreType &cur) {
++    auto funcCoreType = mixedFunc
++                            ->getAttrOfType<hivm::TFuncCoreTypeAttr>(
++                                hivm::TFuncCoreTypeAttr::name)
++                            .getFuncCoreType();
++    if (cur == TCoreType::CUBE_AND_VECTOR) {
++      return kTFuncCoreType2TCoreType.at(funcCoreType);
++    }
++    return cur;
++  };
++  mixedFunc->walk([&rectifyCoreType](Operation *op) {
++    if (isDistributedTypeCustomOp(op)) {
++      if (auto res = hivm::detail::queryCoreTypeHelper(op)) {
++        auto coreType = rectifyCoreType(res.value());
++        auto coreTypeAttr =
++            hivm::TCoreTypeAttr::get(op->getContext(), coreType);
++        op->setAttr(hivm::TCoreTypeAttr::name, coreTypeAttr);
++      }
++    }
++  });
++}
++
+ // erase ops of given core type from function
+ void SplitMixKernelPass::filterMixFunc(OpBuilder &builder,
+                                        func::FuncOp mixedFunc,
+@@ -335,6 +359,12 @@ void SplitMixKernelPass::filterMixFunc(OpBuilder &builder,
+       filterCoreType == TCoreType::CUBE ? TCoreType::VECTOR : TCoreType::CUBE;
+ 
+   SmallVector<Operation *> toSinkOutOfLoop;
++  // TODO: Refactor filter logic: First infer all op's core type, then filter
++  // and erase ops according to core type does not match.
++
++  // because of filter will erase op during walk, distributed op needs infer
++  // core type before filter
++  inferDistributedCoreType(mixedFunc);
+   mixedFunc.walk<WalkOrder::PostOrder>([&](Operation *op) {
+     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+       if (isLoopOfCoreType(forOp, filterCoreType)) {

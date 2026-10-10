@@ -355,28 +355,36 @@ distributed custom-op support (upstream `Ascend/AscendNPU-IR` `fbefed81d`, "Add
 distributed support", 2026-06-05), so its `InferHIVMMemScope` pass saw the custom
 op as an unsupported user of the root alloc and failed the whole pipeline.
 
-That support is backported by **two** patch files, applied (and verified) one at
-a time:
+That support is backported by **three** patch files, applied (and verified) one
+at a time:
 
 * `3rdparty/AscendNPU-IR.patch` -- `no_side_effect` on `hivm.hir.custom`;
 * `3rdparty/AscendNPU-IR-hivm-memscope.patch` -- the distributed branches and
-  `inferAndPropagateMemScopeForDistributed` in `InferHIVMMemScope.{h,cpp}`.
+  `inferAndPropagateMemScopeForDistributed` in `InferHIVMMemScope.{h,cpp}`;
+* `3rdparty/AscendNPU-IR-distributed.patch` -- the rest of the same upstream
+  commit: the distributed-aware lowering in `ConvertToHIVMOp.cpp` (values
+  derived from a distributed custom op are GM, so a masked store into remote
+  memory becomes `hivm.store`/`hivm.load` instead of an unsupported
+  `'hivm.hir.copy' op Unsupported copy from cbuf to gm!`) plus
+  `DistributedTransformUtils.h`, `InferCoreType.cpp`,
+  `LibraryFunctionOpInterfaceImpl.cpp`, `InferHIVMDataLayout.{h,cpp}` and
+  `SplitMixKernel.cpp`.
 
 They are deliberately *not* one combined patch. `git apply` is atomic per
-invocation, so a tree that already carries only one half -- which is exactly what
+invocation, so a tree that already carries only one of them -- which is exactly what
 every checkout that ran the pre-split patch looks like: it has `no_side_effect`
 but not the mem-scope support -- makes a combined patch apply **nothing**, and
 then `--check` *and* `--reverse --check` both fail. `scripts/build_ascend_a{2,3}.sh`
 step 1 would `die` there, *before* step 3 ever rebuilt hivmc, so the old pipeline
-error kept coming back. Split, each half is idempotent on its own.
+error kept coming back. Split, each patch is idempotent on its own.
 
-`scripts/build_ascend_a{2,3}.sh` verify both needles (plus a rebuild stamp, so a
+`scripts/build_ascend_a{2,3}.sh` verify every needle (plus a rebuild stamp, so a
 pre-fix build directory is detected). Those hunks are compiled into
 hivmc/bishengir-compile, so **they only take effect after a rebuild**:
 
 ```sh
 git pull
-bash scripts/repair_ascend_triton_patch.sh   # applies + verifies both patches (both trees)
+bash scripts/repair_ascend_triton_patch.sh   # applies + verifies all patches (both trees)
 FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh: rebuilds hivmc
 torchrun --nproc-per-node=2 --master_port=29501 tutorials/ascend/01-ascend-allgather-gemm.py
 ```

@@ -7,9 +7,10 @@
 #   3rdparty/AscendNPU-IR.patch  -> 3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR
 #                                -> 3rdparty/AscendNPU-IR   (outer tree, built in step 3)
 #   3rdparty/AscendNPU-IR-hivm-memscope.patch -> the same two npuir trees
+#   3rdparty/AscendNPU-IR-distributed.patch   -> the same two npuir trees
 #
-# The AscendNPU-IR change is split over two patch files on purpose: `git apply`
-# is atomic per invocation, so a tree that already carries only one half of a
+# The AscendNPU-IR change is split over three patch files on purpose: `git apply`
+# is atomic per invocation, so a tree that already carries only one of them
 # combined patch makes it fail to apply *entirely* -- and then both `--check`
 # and `--reverse --check` fail, so "already applied" and "broken" look the same.
 # Applied separately, each half is idempotent on its own.
@@ -33,7 +34,9 @@
 # the distributed *frontend* works immediately after this script -- no rebuild.
 # The AscendNPU-IR hunks (the HIVM op definition in 3rdparty/AscendNPU-IR.patch
 # and the distributed HIVM mem-scope support in
-# 3rdparty/AscendNPU-IR-hivm-memscope.patch) are compiled into
+# 3rdparty/AscendNPU-IR-hivm-memscope.patch, plus the distributed HIVM
+# lowering / core-type / library-call-name / data-layout support in
+# 3rdparty/AscendNPU-IR-distributed.patch) are compiled into
 # hivmc/bishengir-compile, so they only take effect at the next build:
 #     FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh
 #
@@ -54,15 +57,19 @@ OUTER_NPU_DIR="3rdparty/AscendNPU-IR"
 TA_PATCH="$REPO_DIR/3rdparty/triton-ascend.patch"
 NPUIR_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR.patch"
 NPUIR_MEMSCOPE_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR-hivm-memscope.patch"
+NPUIR_DISTRIBUTED_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR-distributed.patch"
 HIVM_TD="bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
 HIVM_MEMSCOPE="bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
+HIVM_DISTUTILS="bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+HIVM_CONVERT="bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp"
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 note() { echo "[repair] $*"; }
 
 command -v git >/dev/null 2>&1 || die "git not found"
-[[ -f "$TA_PATCH" && -f "$NPUIR_PATCH" && -f "$NPUIR_MEMSCOPE_PATCH" ]] \
-    || die "missing 3rdparty/triton-ascend.patch, 3rdparty/AscendNPU-IR.patch or 3rdparty/AscendNPU-IR-hivm-memscope.patch -- set REPO_DIR to a Triton-distributed checkout"
+[[ -f "$TA_PATCH" && -f "$NPUIR_PATCH" && -f "$NPUIR_MEMSCOPE_PATCH" \
+   && -f "$NPUIR_DISTRIBUTED_PATCH" ]] \
+    || die "missing 3rdparty/triton-ascend.patch, 3rdparty/AscendNPU-IR.patch, 3rdparty/AscendNPU-IR-hivm-memscope.patch or 3rdparty/AscendNPU-IR-distributed.patch -- set REPO_DIR to a Triton-distributed checkout"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
     || die "$REPO_DIR is not a git checkout (git apply needs one)"
 
@@ -101,7 +108,7 @@ verify_contains "$REPO_DIR/$TA_DIR/third_party/ascend/backend/compiler.py" \
     "add_convert_triton_distributed_to_hivm" \
     "the ascend backend runs the distributed->HIVM pass"
 
-# --- 2. AscendNPU-IR: CustomOp attr + distributed HIVM mem-scope support ------
+# --- 2. AscendNPU-IR: CustomOp attr + distributed HIVM support ----------------
 # setup.py patches the INNER copy (used by the root CMake build); step 3 of
 # scripts/build_ascend_a{2,3}.sh builds hivmc/bishengir-compile from the OUTER
 # copy, so both need everything the patches carry:
@@ -112,6 +119,12 @@ verify_contains "$REPO_DIR/$TA_DIR/third_party/ascend/backend/compiler.py" \
 #     support"): the pinned AscendNPU-IR predates it, and without it hivmc
 #     rejects every distributed kernel with
 #       'hivm.hir.custom' op Unsupported user for root alloc op.
+#   * the rest of that same upstream commit in
+#     3rdparty/AscendNPU-IR-distributed.patch: distributed-aware HIVM lowering
+#     (ConvertToHIVMOp), core-type inference, library call names and data
+#     layout. Without the lowering part, a masked store into the peer buffer is
+#     lowered to an unsupported
+#       'hivm.hir.copy' op Unsupported copy from cbuf to gm!
 #     Those hunks are compiled into hivmc/bishengir-compile, so they only take
 #     effect after a rebuild (unlike the Python frontend below). They are
 #     applied one patch at a time, never as a combined file (see the top of
@@ -119,11 +132,18 @@ verify_contains "$REPO_DIR/$TA_DIR/third_party/ascend/backend/compiler.py" \
 for dir in "$INNER_NPU_DIR" "$OUTER_NPU_DIR"; do
     apply_patch "$dir" "$NPUIR_PATCH" "3rdparty/AscendNPU-IR.patch"
     apply_patch "$dir" "$NPUIR_MEMSCOPE_PATCH" "3rdparty/AscendNPU-IR-hivm-memscope.patch"
+    apply_patch "$dir" "$NPUIR_DISTRIBUTED_PATCH" "3rdparty/AscendNPU-IR-distributed.patch"
     verify_contains "$REPO_DIR/$dir/$HIVM_TD" "UnitAttr:\$no_side_effect" \
         "hivm.hir.custom takes no_side_effect ($dir)"
     verify_contains "$REPO_DIR/$dir/$HIVM_MEMSCOPE" \
         "inferAndPropagateMemScopeForDistributed" \
         "HIVM mem-scope pass handles distributed custom ops ($dir)"
+    verify_contains "$REPO_DIR/$dir/$HIVM_CONVERT" \
+        "isFromDistCallResult" \
+        "HIVM lowering handles distributed call results ($dir)"
+    verify_contains "$REPO_DIR/$dir/$HIVM_DISTUTILS" \
+        "isDistributedTypeCustomOp" \
+        "HIVM distributed transform utils are present ($dir)"
 done
 
 # --- 3. the *runtime* tree, if `triton` is importable here -------------------
@@ -191,7 +211,9 @@ Done. The Python frontend is patched in place, so no rebuild is needed for it:
 
 If the kernel died inside BiShengHIR
     'hivm.hir.custom' op Unsupported user for root alloc op.
-the distributed HIVM mem-scope hunk has to be compiled into
+    'hivm.hir.copy' op Unsupported copy from cbuf to gm!
+the distributed HIVM hunks (3rdparty/AscendNPU-IR-hivm-memscope.patch and
+3rdparty/AscendNPU-IR-distributed.patch) have to be compiled into
 hivmc/bishengir-compile first -- and the other C++/tool-side hunks (the proton
 CMakeLists include path, the HIVM op definition) need a rebuild too:
 

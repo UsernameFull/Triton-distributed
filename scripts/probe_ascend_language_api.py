@@ -292,27 +292,34 @@ def main():
 
 
 def probe_npu_ir_patch():
-    """The vendored AscendNPU-IR trees must carry both npuir patches.
+    """The vendored AscendNPU-IR trees must carry all three npuir patches.
 
     The pinned AscendNPU-IR (triton-ascend's submodule pin, 1b336491) predates
-    HIVM's distributed custom-op support, so the backport is split over two
-    patch files -- ``3rdparty/AscendNPU-IR.patch`` (the HIVM op definition) and
-    ``3rdparty/AscendNPU-IR-hivm-memscope.patch`` (the mem-scope support) --
-    applied separately, because a tree that already carries only one half of a
-    combined patch makes that combined patch apply *nothing* (``git apply`` is
-    atomic per invocation). Together the two patches backport:
+    HIVM's distributed custom-op support, so the backport is split over three
+    patch files -- ``3rdparty/AscendNPU-IR.patch`` (the HIVM op definition),
+    ``3rdparty/AscendNPU-IR-hivm-memscope.patch`` (the mem-scope support) and
+    ``3rdparty/AscendNPU-IR-distributed.patch`` (the distributed lowering /
+    core-type / library-call-name / data-layout support) -- applied separately,
+    because a tree that already carries only one of them makes a combined patch
+    apply *nothing* (``git apply`` is atomic per invocation). Together the
+    patches backport:
 
       * ``no_side_effect`` on ``hivm.hir.custom`` (HIVMOps.td), set by
         ``lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp``;
       * memory-scope support for the distributed custom ops
-        (``InferHIVMMemScope.{h,cpp}``).
+        (``InferHIVMMemScope.{h,cpp}``);
+      * distributed-aware lowering of ``memref.copy`` / materialize ops
+        (``ConvertToHIVMOp.cpp``) plus ``DistributedTransformUtils.h``,
+        ``InferCoreType.cpp``, ``LibraryFunctionOpInterfaceImpl.cpp``,
+        ``InferHIVMDataLayout.{h,cpp}`` and ``SplitMixKernel.cpp``.
 
-    Both are compiled into hivmc/bishengir-compile, so they only take effect
+    All of them are compiled into hivmc/bishengir-compile, so they only take effect
     after a rebuild. Missing them makes BiShengHIR reject every kernel that
     calls an aclshmem helper with
 
       'hivm.hir.custom' op Unsupported user for root alloc op.
       'func.func' op Failed to propagate memory scope for argument #N
+      'hivm.hir.copy' op Unsupported copy from cbuf to gm!
     """
     print()
     print("=" * 72)
@@ -325,6 +332,10 @@ def probe_npu_ir_patch():
          "UnitAttr:$no_side_effect"),
         ("bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp",
          "inferAndPropagateMemScopeForDistributed"),
+        ("bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp",
+         "isFromDistCallResult"),
+        ("bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h",
+         "isDistributedTypeCustomOp"),
     )
     trees = (
         "3rdparty/AscendNPU-IR",

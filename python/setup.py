@@ -134,8 +134,11 @@ def apply_vendored_patch(target_dir, patch_path, label: str, required=()):
       fail, so "already applied" is indistinguishable from "broken" and the
       build dies before rebuilding the compiler.  The AscendNPU-IR change is
       therefore split into ``3rdparty/AscendNPU-IR.patch`` (the HIVM op
-      definition) and ``3rdparty/AscendNPU-IR-hivm-memscope.patch`` (the
-      distributed mem-scope support), applied separately.
+      definition), ``3rdparty/AscendNPU-IR-hivm-memscope.patch`` (the
+      distributed mem-scope support) and
+      ``3rdparty/AscendNPU-IR-distributed.patch`` (the distributed lowering,
+      core-type, library-call-name and data-layout support), each applied
+      separately.
 
     Historical note: the gate used to be ``git diff-index --quiet HEAD`` -- a
     plumbing command that reports CRLF/stat-cache noise as modifications -- so
@@ -205,6 +208,8 @@ class BackendInstaller:
                 TA_patch = TA_dir / "../triton-ascend.patch"
                 npuir_patch = TA_dir / "../AscendNPU-IR.patch"
                 npuir_memscope_patch = TA_dir / "../AscendNPU-IR-hivm-memscope.patch"
+                npuir_distributed_patch = (
+                    TA_dir / "../AscendNPU-IR-distributed.patch")
                 # `required` pins down the parts of each patch the Ascend build
                 # cannot work without, so a silently-skipped `git apply` fails
                 # here instead of at runtime (see apply_vendored_patch).
@@ -216,14 +221,14 @@ class BackendInstaller:
                     ("third_party/ascend/backend/compiler.py",
                      "add_convert_triton_distributed_to_hivm"),
                 ))
-                # Two SEPARATE AscendNPU-IR patches, applied and checked one at
+                # THREE SEPARATE AscendNPU-IR patches, applied and checked one at
                 # a time. A tree that already carries only one of them (e.g.
                 # from an older revision of the same patch) would make a
                 # combined patch fail to apply *entirely* -- `git apply` is
                 # atomic per invocation, and both `--check` and
                 # `--reverse --check` fail on a half-applied patch, so the
                 # build scripts would `die` in step 1 before ever rebuilding
-                # hivmc. Split, each half is idempotent on its own.
+                # hivmc. Split, each one is idempotent on its own.
                 apply_vendored_patch(npuir_path, npuir_patch, "AscendNPU-IR", required=(
                     ("bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td",
                      "UnitAttr:$no_side_effect"),
@@ -240,6 +245,19 @@ class BackendInstaller:
                         #   'hivm.hir.custom' op Unsupported user for root alloc op.
                         ("bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp",
                          "inferAndPropagateMemScopeForDistributed"),
+                    ))
+                apply_vendored_patch(
+                    npuir_path, npuir_distributed_patch,
+                    "AscendNPU-IR (distributed lowering)", required=(
+                        # The rest of AscendNPU-IR's "Add distributed support":
+                        # ConvertToHIVMOp has to treat memrefs derived from a
+                        # distributed custom op as GM, otherwise the masked
+                        # store into the peer buffer is lowered to an
+                        # unsupported `hivm.hir.copy ... cbuf to gm`.
+                        ("bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp",
+                         "isFromDistCallResult"),
+                        ("bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h",
+                         "isDistributedTypeCustomOp"),
                     ))
 
             backend_src_dir = os.path.join(root_dir, backend_name)

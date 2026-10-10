@@ -133,9 +133,11 @@ echo "python: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 # `git checkout --` is a no-op here (CRLF worktree == LF blob counts as
 # unmodified under autocrlf), so remove the files first.
 rm -f "$ROOT/3rdparty/triton-ascend.patch" "$ROOT/3rdparty/AscendNPU-IR.patch" \
-      "$ROOT/3rdparty/AscendNPU-IR-hivm-memscope.patch"
+      "$ROOT/3rdparty/AscendNPU-IR-hivm-memscope.patch" \
+      "$ROOT/3rdparty/AscendNPU-IR-distributed.patch"
 git -C "$ROOT" checkout -- 3rdparty/triton-ascend.patch 3rdparty/AscendNPU-IR.patch \
-    3rdparty/AscendNPU-IR-hivm-memscope.patch
+    3rdparty/AscendNPU-IR-hivm-memscope.patch \
+    3rdparty/AscendNPU-IR-distributed.patch
 if command -v nproc >/dev/null 2>&1; then
     df -h "$WORK" | tail -1
     echo "(need ~8 GB free in the scratch filesystem)"
@@ -502,6 +504,7 @@ git add -f -A \
     3rdparty/nlohmann-json \
     3rdparty/VENDORED.md \
     3rdparty/.gitattributes \
+    3rdparty/AscendNPU-IR-distributed.patch \
     .gitattributes \
     .gitmodules
 
@@ -567,11 +570,17 @@ check_vendored_patch "$INNER_NPU" \
 check_vendored_patch "$INNER_NPU" \
     "$ROOT/3rdparty/AscendNPU-IR-hivm-memscope.patch" \
     "3rdparty/AscendNPU-IR-hivm-memscope.patch"
+check_vendored_patch "$INNER_NPU" \
+    "$ROOT/3rdparty/AscendNPU-IR-distributed.patch" \
+    "3rdparty/AscendNPU-IR-distributed.patch"
 check_vendored_patch "$ROOT/3rdparty/AscendNPU-IR" \
     "$ROOT/3rdparty/AscendNPU-IR.patch" "3rdparty/AscendNPU-IR.patch (outer tree)"
 check_vendored_patch "$ROOT/3rdparty/AscendNPU-IR" \
     "$ROOT/3rdparty/AscendNPU-IR-hivm-memscope.patch" \
     "3rdparty/AscendNPU-IR-hivm-memscope.patch (outer tree)"
+check_vendored_patch "$ROOT/3rdparty/AscendNPU-IR" \
+    "$ROOT/3rdparty/AscendNPU-IR-distributed.patch" \
+    "3rdparty/AscendNPU-IR-distributed.patch (outer tree)"
 exec_count=$(git ls-files -s 3rdparty | awk '$1=="100755"' | wc -l)
 echo "  exec-bit files staged under 3rdparty/: $exec_count (expect >0, e.g. npuir build-tools/*.sh)"
 [[ "$exec_count" -gt 0 ]] || fail=1
