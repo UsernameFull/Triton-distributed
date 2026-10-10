@@ -545,7 +545,8 @@ banner "step 3: build vendored AscendNPU-IR"
 NPU_SHA="$(vendor_sha "$REPO_DIR/3rdparty/AscendNPU-IR")"
 if [[ "$FORCE" != "1" && -f "$WORK_ROOT/.stamp_npu_ir" \
       && "$(cat "$WORK_ROOT/.stamp_npu_ir")" == "$NPU_SHA" \
-      && -d "$NPU_IR_DIR/build/bin" ]]; then
+      && -d "$NPU_IR_DIR/build/bin" \
+      && -f "$NPU_IR_DIR/build/lib/meta_op.aic.bc" ]]; then
     echo "AscendNPU-IR $NPU_SHA already built (stamp matches), skipping. FORCE=1 to rebuild."
 else
     : "${ASCEND_HOME_PATH:?CANN set_env.sh did not define ASCEND_HOME_PATH -- check CANN_ENV}"
@@ -559,19 +560,33 @@ else
     # npuir's llvm patches PRE-APPLIED and its test suites trimmed:
     #   * no --apply-patches (would `git reset --hard` + re-patch; also needs
     #     third-party/torch-mlir which we intentionally do not vendor)
-    #   * no -t (check-mlir/check-bishengir lit suites need the trimmed test
-    #     trees; plain `ninja` builds a superset of the required binaries)
+    #   * no --build-test (check-mlir/check-bishengir lit suites need the
+    #     trimmed test trees; plain `ninja` builds a superset of the required
+    #     binaries)
     #   * *_INCLUDE_TESTS=OFF + INCLUDE_BENCHMARKS=OFF via --add-cmake-options
     #     (test suites and third-party/benchmark were trimmed from the tree)
     # Flag names verified against 3rdparty/AscendNPU-IR/build-tools/build.sh
     # (--help): the compiler path option is --bisheng-compiler=<dir>, NOT
     # --bisheng-compile, and the template switch is -t/--build-bishengir-template,
     # NOT --build-shmem-template. An unknown option aborts at argument-parse time
-    # with `Error: Unknown option: --bisheng-compile=<dir>`. The template build is
-    # OFF by default and unused by this flow, so it is simply dropped.
+    # with `Error: Unknown option: --bisheng-compile=<dir>`.
+    # -t (BISHENGIR_BUILD_TEMPLATE=ON) is REQUIRED: it compiles the Template
+    # sources with CANN's ccec/llvm-link and links them into the device-side
+    # meta-op bitcode at build/lib/{meta_op.aic,meta_op.aiv,meta_op.mix.aic,
+    # meta_op.mix.aiv,host}.bc. bishengir-compile attaches those files to every
+    # HIVM module and CANN's hivmc links them into the kernel binary; without
+    # them hivmc fails for EVERY kernel with
+    #     error: Failed to compile BiShengLIR to binary
+    # (after bishengir-compile itself reported success), which surfaces as a
+    # runtime "kernel smoke compilation" failure, not a build failure.
     bash ./build-tools/build.sh -o ./build -j "$JOBS" --build-type Release \
+        -t \
         --bisheng-compiler="$ASCEND_HOME_PATH/bin" \
         --add-cmake-options="-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF"
+    for bc in meta_op.aic.bc meta_op.aiv.bc meta_op.mix.aic.bc meta_op.mix.aiv.bc host.bc; do
+        [[ -f "$NPU_IR_DIR/build/lib/$bc" ]] \
+            || die "AscendNPU-IR built without build/lib/$bc -- hivmc cannot compile any kernel without the meta-op bitcode (needs CANN's $ASCEND_HOME_PATH/bin/{ccec,llvm-link}; never drop -t)"
+    done
     echo "$NPU_SHA" > "$WORK_ROOT/.stamp_npu_ir"
 fi
 export PATH="$NPU_IR_DIR/build/bin:$PATH"

@@ -269,6 +269,17 @@ causes of `-11`:
 * **`bishengir-compile` not on `PATH`** -- the exported
   `$HOME/ascend-build/AscendNPU-IR/build/bin` is what compiles the kernel at run
   time, so run the examples from a shell that has it;
+* **every kernel fails with `error: Failed to compile BiShengLIR to binary`**
+  -- `bishengir-compile` succeeded but CANN's `hivmc` could not link the device
+  binary. That means the device-side meta-op bitcode is missing from
+  `$HOME/ascend-build/AscendNPU-IR/build/lib/`
+  (`meta_op.aic.bc`, `meta_op.aiv.bc`, `meta_op.mix.aic.bc`,
+  `meta_op.mix.aiv.bc`, `host.bc`). Those files are only produced when
+  `AscendNPU-IR/build-tools/build.sh` runs with `-t`
+  (`BISHENGIR_BUILD_TEMPLATE=ON`), which needs CANN's
+  `$ASCEND_HOME_PATH/bin/{ccec,llvm-link}`. The build scripts pass `-t` and
+  hard-verify the bitcode; if you built `AscendNPU-IR` by hand, rebuild it with
+  `-t`;
 * **`triton` / `shmem` resolving to a preinstalled package** in `site-packages`
   instead of this checkout -- `scripts/build_ascend_a3.sh` purges shadowing
   installs and verifies the resolved `libtriton`, and the triage log prints the
