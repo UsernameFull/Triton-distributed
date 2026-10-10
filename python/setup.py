@@ -210,6 +210,8 @@ class BackendInstaller:
                 npuir_memscope_patch = TA_dir / "../AscendNPU-IR-hivm-memscope.patch"
                 npuir_distributed_patch = (
                     TA_dir / "../AscendNPU-IR-distributed.patch")
+                npuir_mark_stride_align_patch = (
+                    TA_dir / "../AscendNPU-IR-hivm-mark-stride-align.patch")
                 # `required` pins down the parts of each patch the Ascend build
                 # cannot work without, so a silently-skipped `git apply` fails
                 # here instead of at runtime (see apply_vendored_patch).
@@ -221,7 +223,7 @@ class BackendInstaller:
                     ("third_party/ascend/backend/compiler.py",
                      "add_convert_triton_distributed_to_hivm"),
                 ))
-                # THREE SEPARATE AscendNPU-IR patches, applied and checked one at
+                # FOUR SEPARATE AscendNPU-IR patches, applied and checked one at
                 # a time. A tree that already carries only one of them (e.g.
                 # from an older revision of the same patch) would make a
                 # combined patch fail to apply *entirely* -- `git apply` is
@@ -258,6 +260,21 @@ class BackendInstaller:
                          "isFromDistCallResult"),
                         ("bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h",
                          "isDistributedTypeCustomOp"),
+                    ))
+                apply_vendored_patch(
+                    npuir_path, npuir_mark_stride_align_patch,
+                    "AscendNPU-IR (distributed custom ops vs stride align)",
+                    required=(
+                        # `hivm-mark-stride-align` used to run its
+                        # "Not bufferized." assertion *before* the CustomOp
+                        # handling, so an `hivm.hir.custom` with no operands at
+                        # all (the distributed aclshmem_barrier_all helper that
+                        # libshmem_device.barrier_all() becomes) aborted the whole
+                        # BiShengHIR pipeline: MLIR's
+                        # hasPureBufferSemantics() also requires at least one
+                        # memref operand.
+                        ("bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp",
+                         "Custom ops are handled before the"),
                     ))
 
             backend_src_dir = os.path.join(root_dir, backend_name)

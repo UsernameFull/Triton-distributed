@@ -8,8 +8,9 @@
 #                                -> 3rdparty/AscendNPU-IR   (outer tree, built in step 3)
 #   3rdparty/AscendNPU-IR-hivm-memscope.patch -> the same two npuir trees
 #   3rdparty/AscendNPU-IR-distributed.patch   -> the same two npuir trees
+#   3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch -> the same two npuir trees
 #
-# The AscendNPU-IR change is split over three patch files on purpose: `git apply`
+# The AscendNPU-IR change is split over four patch files on purpose: `git apply`
 # is atomic per invocation, so a tree that already carries only one of them
 # combined patch makes it fail to apply *entirely* -- and then both `--check`
 # and `--reverse --check` fail, so "already applied" and "broken" look the same.
@@ -36,7 +37,8 @@
 # and the distributed HIVM mem-scope support in
 # 3rdparty/AscendNPU-IR-hivm-memscope.patch, plus the distributed HIVM
 # lowering / core-type / library-call-name / data-layout support in
-# 3rdparty/AscendNPU-IR-distributed.patch) are compiled into
+# 3rdparty/AscendNPU-IR-distributed.patch and the custom-op ordering fix in
+# 3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch) are compiled into
 # hivmc/bishengir-compile, so they only take effect at the next build:
 #     FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh
 #
@@ -58,18 +60,20 @@ TA_PATCH="$REPO_DIR/3rdparty/triton-ascend.patch"
 NPUIR_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR.patch"
 NPUIR_MEMSCOPE_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR-hivm-memscope.patch"
 NPUIR_DISTRIBUTED_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR-distributed.patch"
+NPUIR_STRALIGN_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch"
 HIVM_TD="bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
 HIVM_MEMSCOPE="bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
 HIVM_DISTUTILS="bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
 HIVM_CONVERT="bishengir/lib/Dialect/HIVM/Transforms/ConvertToHIVMOp.cpp"
+HIVM_STRALIGN="bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp"
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 note() { echo "[repair] $*"; }
 
 command -v git >/dev/null 2>&1 || die "git not found"
 [[ -f "$TA_PATCH" && -f "$NPUIR_PATCH" && -f "$NPUIR_MEMSCOPE_PATCH" \
-   && -f "$NPUIR_DISTRIBUTED_PATCH" ]] \
-    || die "missing 3rdparty/triton-ascend.patch, 3rdparty/AscendNPU-IR.patch, 3rdparty/AscendNPU-IR-hivm-memscope.patch or 3rdparty/AscendNPU-IR-distributed.patch -- set REPO_DIR to a Triton-distributed checkout"
+   && -f "$NPUIR_DISTRIBUTED_PATCH" && -f "$NPUIR_STRALIGN_PATCH" ]] \
+    || die "missing 3rdparty/triton-ascend.patch, 3rdparty/AscendNPU-IR.patch, 3rdparty/AscendNPU-IR-hivm-memscope.patch, 3rdparty/AscendNPU-IR-distributed.patch or 3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch -- set REPO_DIR to a Triton-distributed checkout"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
     || die "$REPO_DIR is not a git checkout (git apply needs one)"
 
@@ -125,6 +129,13 @@ verify_contains "$REPO_DIR/$TA_DIR/third_party/ascend/backend/compiler.py" \
 #     layout. Without the lowering part, a masked store into the peer buffer is
 #     lowered to an unsupported
 #       'hivm.hir.copy' op Unsupported copy from cbuf to gm!
+#   * 3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch: `hivm-mark-stride-align`
+#     handles CustomOp *before* its "Not bufferized." assertion. Every aclshmem
+#     helper becomes an `hivm.hir.custom`, and the ones without operands
+#     (libshmem_device.barrier_all()) also have no memref operand, which is what
+#     DestinationStyleOpInterface::hasPureBufferSemantics() requires -- so the
+#     pinned pass aborted the pipeline with
+#       loc("kernel.mlir":N:7): error: Not bufferized.
 #     Those hunks are compiled into hivmc/bishengir-compile, so they only take
 #     effect after a rebuild (unlike the Python frontend below). They are
 #     applied one patch at a time, never as a combined file (see the top of
@@ -133,6 +144,7 @@ for dir in "$INNER_NPU_DIR" "$OUTER_NPU_DIR"; do
     apply_patch "$dir" "$NPUIR_PATCH" "3rdparty/AscendNPU-IR.patch"
     apply_patch "$dir" "$NPUIR_MEMSCOPE_PATCH" "3rdparty/AscendNPU-IR-hivm-memscope.patch"
     apply_patch "$dir" "$NPUIR_DISTRIBUTED_PATCH" "3rdparty/AscendNPU-IR-distributed.patch"
+    apply_patch "$dir" "$NPUIR_STRALIGN_PATCH" "3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch"
     verify_contains "$REPO_DIR/$dir/$HIVM_TD" "UnitAttr:\$no_side_effect" \
         "hivm.hir.custom takes no_side_effect ($dir)"
     verify_contains "$REPO_DIR/$dir/$HIVM_MEMSCOPE" \
@@ -144,6 +156,9 @@ for dir in "$INNER_NPU_DIR" "$OUTER_NPU_DIR"; do
     verify_contains "$REPO_DIR/$dir/$HIVM_DISTUTILS" \
         "isDistributedTypeCustomOp" \
         "HIVM distributed transform utils are present ($dir)"
+    verify_contains "$REPO_DIR/$dir/$HIVM_STRALIGN" \
+        "Custom ops are handled before the" \
+        "hivm-mark-stride-align handles custom ops before its buffer check ($dir)"
 done
 
 # --- 3. the *runtime* tree, if `triton` is importable here -------------------

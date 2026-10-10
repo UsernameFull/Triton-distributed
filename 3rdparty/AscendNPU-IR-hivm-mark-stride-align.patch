@@ -1,0 +1,66 @@
+diff --git a/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp b/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp
+--- a/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp
++++ b/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp
+@@ -135,34 +135,38 @@
+       return WalkResult::advance();
+     }
+ 
++    if (isa<CustomOp>(op)) {
++      // Custom ops are handled before the "Not bufferized." check below: a
++      // custom op may legitimately carry no operands (e.g. the distributed
++      // aclshmem_barrier_all helper), and hasPureBufferSemantics() also
++      // requires at least one memref operand.
++      ArrayAttr argAttrs =
++          op->getAttrOfType<ArrayAttr>(CustomOp::kArgAttrsName);
++      if (!argAttrs)
++        return WalkResult::advance();
++
++      for (const auto &[idx, dictAttrs] : llvm::enumerate(argAttrs)) {
++        auto dict = dyn_cast_or_null<DictionaryAttr>(dictAttrs);
++        if (!dict)
++          continue;
++
++        auto intAttr =
++            dyn_cast_or_null<IntegerAttr>(dict.get(CustomOp::kAlignDimName));
++        if (!intAttr)
++          continue;
++
++        const int alignDim = intAttr.getInt();
++        if (failed(markAlignedDim(builder, op, op->getOperand(idx), alignDim)))
++          return WalkResult::interrupt();
++      }
++
++      return WalkResult::advance();
++    }
++
+     auto hivmOp = cast<HIVMStructuredOp>(op);
+     if (!hivmOp.hasPureBufferSemantics()) {
+       hivmOp->emitError("Not bufferized.");
+       return WalkResult::interrupt();
+-    }
+-
+-    if (isa<CustomOp>(op)) {
+-      ArrayAttr argAttrs =
+-          op->getAttrOfType<ArrayAttr>(CustomOp::kArgAttrsName);
+-      if (!argAttrs)
+-        return WalkResult::advance();
+-
+-      for (const auto &[idx, dictAttrs] : llvm::enumerate(argAttrs)) {
+-        auto dict = dyn_cast_or_null<DictionaryAttr>(dictAttrs);
+-        if (!dict)
+-          continue;
+-
+-        auto intAttr =
+-            dyn_cast_or_null<IntegerAttr>(dict.get(CustomOp::kAlignDimName));
+-        if (!intAttr)
+-          continue;
+-
+-        const int alignDim = intAttr.getInt();
+-        if (failed(markAlignedDim(builder, op, op->getOperand(idx), alignDim)))
+-          return WalkResult::interrupt();
+-      }
+-
+-      return WalkResult::advance();
+     }
+ 
+     if (isa<hivm::VTransposeOp>(op) &&

@@ -80,12 +80,14 @@
 # Repair an existing tree (no rebuild) with scripts/repair_ascend_triton_patch.sh.
 # 3rdparty/AscendNPU-IR.patch and 3rdparty/AscendNPU-IR-hivm-memscope.patch are
 # checked as well (step 1 + step 3), together with
-# 3rdparty/AscendNPU-IR-distributed.patch: the pinned AscendNPU-IR predates
-# HIVM's distributed custom-op support, so the patches backport it; without it
-# hivmc rejects every kernel that calls an aclshmem helper with
+# 3rdparty/AscendNPU-IR-distributed.patch and
+# 3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch: the pinned AscendNPU-IR
+# predates HIVM's distributed custom-op support, so the patches backport it;
+# without them hivmc rejects every kernel that calls an aclshmem helper with
 #     'hivm.hir.custom' op Unsupported user for root alloc op.
 #     'func.func' op Failed to propagate memory scope for argument #N
 #     'hivm.hir.copy' op Unsupported copy from cbuf to gm!
+#     loc("kernel.mlir":N:7): error: Not bufferized.   (aclshmem_barrier_all)
 # and those hunks DO need a rebuild (step 3) before they take effect.
 set -euo pipefail
 
@@ -476,7 +478,8 @@ check_vendored() {  # non-zero (and logs [MISSING] lines) if 3rdparty/ is incomp
         3rdparty/triton-ascend.patch \
         3rdparty/AscendNPU-IR.patch \
         3rdparty/AscendNPU-IR-hivm-memscope.patch \
-        3rdparty/AscendNPU-IR-distributed.patch
+        3rdparty/AscendNPU-IR-distributed.patch \
+        3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch
     do
         if [[ -e "$REPO_DIR/$f" ]]; then
             echo "[OK] $f"
@@ -573,6 +576,7 @@ NPUIR_PATCHES=(
     "3rdparty/AscendNPU-IR.patch"
     "3rdparty/AscendNPU-IR-hivm-memscope.patch"
     "3rdparty/AscendNPU-IR-distributed.patch"
+    "3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch"
 )
 for npuir_tree in "$INNER_NPU_DIR" "$REPO_DIR/3rdparty/AscendNPU-IR"; do
     for npuir_p in "${NPUIR_PATCHES[@]}"; do
@@ -584,7 +588,7 @@ done
 # (3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR), which is what the
 # root CMake build compiles. Step 3 builds hivmc / bishengir-compile from the
 # OUTER 3rdparty/AscendNPU-IR, so that tree has to carry the same changes.
-# The distributed flow needs three independent things, carried by three patches:
+# The distributed flow needs four independent things, carried by four patches:
 #   * 3rdparty/AscendNPU-IR.patch -- the `no_side_effect` unit attr on
 #     `hivm.hir.custom` (HIVMOps.td), set by
 #     lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp;
@@ -602,6 +606,15 @@ done
 #     `hivm.hir.copy ... cbuf to gm`), plus the distributed core-type / library
 #     call-name / data-layout handling (InferCoreType, LibraryFunctionOpInterface,
 #     InferHIVMDataLayout, SplitMixKernel, DistributedTransformUtils.h).
+#   * 3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch -- `hivm-mark-stride-align`
+#     must handle CustomOp *before* its "Not bufferized." assertion. Every
+#     aclshmem helper becomes an `hivm.hir.custom`, and the ones without
+#     operands (libshmem_device.barrier_all() -> aclshmem_barrier_all) satisfy
+#     DestinationStyleOpInterface::hasPureBufferSemantics() == false, because
+#     that also requires *at least one* memref operand. The pinned pass
+#     therefore aborted the pipeline with
+#       loc("kernel.mlir":N:7): error: Not bufferized.
+#     (and, being a CUBE_AND_VECTOR op, it did so once per mix half).
 # Apply them one at a time -- again from the repo root with --directory:
 # `git apply` is atomic per invocation, so a tree that already carries only one
 # half of a combined patch would make that combined patch apply *nothing*.
@@ -622,12 +635,15 @@ apply_outer_npuir_patch() {
     local td="$rel/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
     local memscope="$rel/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
     local distutils="$rel/bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+    local stralign="$rel/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp"
     apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR.patch" \
         "$td" 'UnitAttr:$no_side_effect'
     apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR-hivm-memscope.patch" \
         "$memscope" 'inferAndPropagateMemScopeForDistributed'
     apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR-distributed.patch" \
         "$distutils" 'isDistributedTypeCustomOp'
+    apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch" \
+        "$stralign" 'Custom ops are handled before the'
 }
 apply_outer_npuir_patch
 
@@ -699,10 +715,12 @@ NPU_SHA="$(vendor_sha "$REPO_DIR/3rdparty/AscendNPU-IR")"
 NPUIR_TD="$NPU_IR_DIR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
 NPUIR_MEMSCOPE="$NPU_IR_DIR/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
 NPUIR_DISTUTILS="$NPU_IR_DIR/bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
+NPUIR_STRALIGN="$NPU_IR_DIR/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp"
 NPUIR_PATCHED=0
 if grep -qF 'UnitAttr:$no_side_effect' "$NPUIR_TD" 2>/dev/null \
    && grep -qF 'inferAndPropagateMemScopeForDistributed' "$NPUIR_MEMSCOPE" 2>/dev/null \
-   && grep -qF 'isDistributedTypeCustomOp' "$NPUIR_DISTUTILS" 2>/dev/null; then
+   && grep -qF 'isDistributedTypeCustomOp' "$NPUIR_DISTUTILS" 2>/dev/null \
+   && grep -qF 'Custom ops are handled before the' "$NPUIR_STRALIGN" 2>/dev/null; then
     NPUIR_PATCHED=1
 fi
 if [[ "$FORCE" != "1" && -f "$WORK_ROOT/.stamp_npu_ir" \

@@ -355,8 +355,8 @@ distributed custom-op support (upstream `Ascend/AscendNPU-IR` `fbefed81d`, "Add
 distributed support", 2026-06-05), so its `InferHIVMMemScope` pass saw the custom
 op as an unsupported user of the root alloc and failed the whole pipeline.
 
-That support is backported by **three** patch files, applied (and verified) one
-at a time:
+That support, plus the follow-up `Not bufferized.` fix, is backported by **four**
+patch files, applied (and verified) one at a time:
 
 * `3rdparty/AscendNPU-IR.patch` -- `no_side_effect` on `hivm.hir.custom`;
 * `3rdparty/AscendNPU-IR-hivm-memscope.patch` -- the distributed branches and
@@ -369,6 +369,13 @@ at a time:
   `DistributedTransformUtils.h`, `InferCoreType.cpp`,
   `LibraryFunctionOpInterfaceImpl.cpp`, `InferHIVMDataLayout.{h,cpp}` and
   `SplitMixKernel.cpp`.
+* `3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch` -- handle zero-operand
+  custom ops in `MarkStrideAlign.cpp` before checking
+  `hasPureBufferSemantics()`. `libshmem_device.barrier_all()` lowers to a
+  `hivm.hir.custom "dist.aclshmem_barrier_all"` with no operands, and MLIR's
+  `hasPureBufferSemantics()` also requires at least one memref operand, so the
+  pass otherwise fails with `error: Not bufferized.` after the `cbuf to gm`
+  fix lets compilation get further.
 
 They are deliberately *not* one combined patch. `git apply` is atomic per
 invocation, so a tree that already carries only one of them -- which is exactly what
