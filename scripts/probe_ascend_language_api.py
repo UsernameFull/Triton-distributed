@@ -292,10 +292,15 @@ def main():
 
 
 def probe_npu_ir_patch():
-    """The vendored AscendNPU-IR trees must carry ``AscendNPU-IR.patch``.
+    """The vendored AscendNPU-IR trees must carry both npuir patches.
 
     The pinned AscendNPU-IR (triton-ascend's submodule pin, 1b336491) predates
-    HIVM's distributed custom-op support, so the patch backports two things:
+    HIVM's distributed custom-op support, so the backport is split over two
+    patch files -- ``3rdparty/AscendNPU-IR.patch`` (the HIVM op definition) and
+    ``3rdparty/AscendNPU-IR-hivm-memscope.patch`` (the mem-scope support) --
+    applied separately, because a tree that already carries only one half of a
+    combined patch makes that combined patch apply *nothing* (``git apply`` is
+    atomic per invocation). Together the two patches backport:
 
       * ``no_side_effect`` on ``hivm.hir.custom`` (HIVMOps.td), set by
         ``lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp``;
@@ -338,7 +343,7 @@ def probe_npu_ir_patch():
                 continue
             report(f"{label}: {os.path.basename(rel)} carries the patch", needle in body,
                    "" if needle in body else
-                   "3rdparty/AscendNPU-IR.patch is not applied -- fix: "
+                   "3rdparty/AscendNPU-IR*.patch is not applied -- fix: "
                    "bash scripts/repair_ascend_triton_patch.sh, then rebuild with "
                    "FORCE=1 bash scripts/build_ascend_a3.sh (or build_ascend_a2.sh)")
 

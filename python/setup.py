@@ -117,7 +117,7 @@ def apply_vendored_patch(target_dir, patch_path, label: str, required=()):
       ``Skipped patch '<file>'.`` on stdout -- and the exit status is still 0.
       Running it with ``cwd=target_dir`` therefore applied nothing at all for
       patches whose paths are relative to the repository root
-      (``3rdparty/triton-ascend.patch``, ``3rdparty/AscendNPU-IR.patch``), and
+      (``3rdparty/triton-ascend.patch``, ``3rdparty/AscendNPU-IR*.patch``), and
       ``--check`` *and* ``--reverse --check`` both returned 0, so the patch also
       looked "already applied".  Run it from the repository root with
       ``--directory=<target_dir>`` instead.
@@ -127,6 +127,15 @@ def apply_vendored_patch(target_dir, patch_path, label: str, required=()):
       without the distributed frontend, which only shows up much later as
       ``AttributeError: 'triton._C.libtriton.ir.builder' object has no
       attribute 'create_symm_at'``.
+    * a change is applied as its own patch file, never merged into a bigger
+      one: ``git apply`` is atomic per invocation, so a tree that already
+      carries only *part* of a combined patch makes it fail to apply
+      **entirely** -- and then ``--check`` *and* ``--reverse --check`` both
+      fail, so "already applied" is indistinguishable from "broken" and the
+      build dies before rebuilding the compiler.  The AscendNPU-IR change is
+      therefore split into ``3rdparty/AscendNPU-IR.patch`` (the HIVM op
+      definition) and ``3rdparty/AscendNPU-IR-hivm-memscope.patch`` (the
+      distributed mem-scope support), applied separately.
 
     Historical note: the gate used to be ``git diff-index --quiet HEAD`` -- a
     plumbing command that reports CRLF/stat-cache noise as modifications -- so
@@ -195,6 +204,7 @@ class BackendInstaller:
                 npuir_path = TA_dir / "third_party/ascend/AscendNPU-IR"
                 TA_patch = TA_dir / "../triton-ascend.patch"
                 npuir_patch = TA_dir / "../AscendNPU-IR.patch"
+                npuir_memscope_patch = TA_dir / "../AscendNPU-IR-hivm-memscope.patch"
                 # `required` pins down the parts of each patch the Ascend build
                 # cannot work without, so a silently-skipped `git apply` fails
                 # here instead of at runtime (see apply_vendored_patch).
@@ -206,19 +216,31 @@ class BackendInstaller:
                     ("third_party/ascend/backend/compiler.py",
                      "add_convert_triton_distributed_to_hivm"),
                 ))
+                # Two SEPARATE AscendNPU-IR patches, applied and checked one at
+                # a time. A tree that already carries only one of them (e.g.
+                # from an older revision of the same patch) would make a
+                # combined patch fail to apply *entirely* -- `git apply` is
+                # atomic per invocation, and both `--check` and
+                # `--reverse --check` fail on a half-applied patch, so the
+                # build scripts would `die` in step 1 before ever rebuilding
+                # hivmc. Split, each half is idempotent on its own.
                 apply_vendored_patch(npuir_path, npuir_patch, "AscendNPU-IR", required=(
                     ("bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td",
                      "UnitAttr:$no_side_effect"),
-                    # The HIVM mem-scope pass has to know the distributed
-                    # custom ops the distributed->HIVM pass emits
-                    # (`hivm.hir.custom` + `hivm.is_distributed`); the pinned
-                    # AscendNPU-IR predates that, so the patch backports it.
-                    # Without it hivmc rejects every kernel that calls an
-                    # aclshmem helper with
-                    #   'hivm.hir.custom' op Unsupported user for root alloc op.
-                    ("bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp",
-                     "inferAndPropagateMemScopeForDistributed"),
                 ))
+                apply_vendored_patch(
+                    npuir_path, npuir_memscope_patch, "AscendNPU-IR (HIVM mem-scope)",
+                    required=(
+                        # The HIVM mem-scope pass has to know the distributed
+                        # custom ops the distributed->HIVM pass emits
+                        # (`hivm.hir.custom` + `hivm.is_distributed`); the pinned
+                        # AscendNPU-IR predates that, so the patch backports it.
+                        # Without it hivmc rejects every kernel that calls an
+                        # aclshmem helper with
+                        #   'hivm.hir.custom' op Unsupported user for root alloc op.
+                        ("bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp",
+                         "inferAndPropagateMemScopeForDistributed"),
+                    ))
 
             backend_src_dir = os.path.join(root_dir, backend_name)
 

@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #
-# Re-apply (and verify) the two vendored patches the Ascend build depends on:
+# Re-apply (and verify) the vendored patches the Ascend build depends on:
 #
 #   3rdparty/triton-ascend.patch -> 3rdparty/triton-ascend
 #   3rdparty/AscendNPU-IR.patch  -> 3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR
 #                                -> 3rdparty/AscendNPU-IR   (outer tree, built in step 3)
+#   3rdparty/AscendNPU-IR-hivm-memscope.patch -> the same two npuir trees
+#
+# The AscendNPU-IR change is split over two patch files on purpose: `git apply`
+# is atomic per invocation, so a tree that already carries only one half of a
+# combined patch makes it fail to apply *entirely* -- and then both `--check`
+# and `--reverse --check` fail, so "already applied" and "broken" look the same.
+# Applied separately, each half is idempotent on its own.
 #
 # Why this exists: `git apply` resolves patch paths against the CURRENT working
 # directory and silently skips ("Skipped patch '<file>'", exit status still 0)
@@ -24,9 +31,10 @@
 #
 # triton-ascend's hunks are pure Python (plus one CMakeLists include path), so
 # the distributed *frontend* works immediately after this script -- no rebuild.
-# The AscendNPU-IR hunks (the HIVM op definition and the distributed HIVM
-# mem-scope support) are compiled into hivmc/bishengir-compile, so they only
-# take effect at the next build:
+# The AscendNPU-IR hunks (the HIVM op definition in 3rdparty/AscendNPU-IR.patch
+# and the distributed HIVM mem-scope support in
+# 3rdparty/AscendNPU-IR-hivm-memscope.patch) are compiled into
+# hivmc/bishengir-compile, so they only take effect at the next build:
 #     FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh
 #
 # Usage:
@@ -45,6 +53,7 @@ INNER_NPU_DIR="$TA_DIR/third_party/ascend/AscendNPU-IR"
 OUTER_NPU_DIR="3rdparty/AscendNPU-IR"
 TA_PATCH="$REPO_DIR/3rdparty/triton-ascend.patch"
 NPUIR_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR.patch"
+NPUIR_MEMSCOPE_PATCH="$REPO_DIR/3rdparty/AscendNPU-IR-hivm-memscope.patch"
 HIVM_TD="bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
 HIVM_MEMSCOPE="bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
 
@@ -52,8 +61,8 @@ die() { echo "[ERROR] $*" >&2; exit 1; }
 note() { echo "[repair] $*"; }
 
 command -v git >/dev/null 2>&1 || die "git not found"
-[[ -f "$TA_PATCH" && -f "$NPUIR_PATCH" ]] \
-    || die "missing 3rdparty/triton-ascend.patch or 3rdparty/AscendNPU-IR.patch -- set REPO_DIR to a Triton-distributed checkout"
+[[ -f "$TA_PATCH" && -f "$NPUIR_PATCH" && -f "$NPUIR_MEMSCOPE_PATCH" ]] \
+    || die "missing 3rdparty/triton-ascend.patch, 3rdparty/AscendNPU-IR.patch or 3rdparty/AscendNPU-IR-hivm-memscope.patch -- set REPO_DIR to a Triton-distributed checkout"
 git -C "$REPO_DIR" rev-parse --git-dir >/dev/null 2>&1 \
     || die "$REPO_DIR is not a git checkout (git apply needs one)"
 
@@ -95,7 +104,7 @@ verify_contains "$REPO_DIR/$TA_DIR/third_party/ascend/backend/compiler.py" \
 # --- 2. AscendNPU-IR: CustomOp attr + distributed HIVM mem-scope support ------
 # setup.py patches the INNER copy (used by the root CMake build); step 3 of
 # scripts/build_ascend_a{2,3}.sh builds hivmc/bishengir-compile from the OUTER
-# copy, so both need everything the patch carries:
+# copy, so both need everything the patches carry:
 #   * the `no_side_effect` unit attr on `hivm.hir.custom`, which
 #     lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp sets;
 #   * HIVM memory-scope support for the distributed custom ops in
@@ -103,10 +112,13 @@ verify_contains "$REPO_DIR/$TA_DIR/third_party/ascend/backend/compiler.py" \
 #     support"): the pinned AscendNPU-IR predates it, and without it hivmc
 #     rejects every distributed kernel with
 #       'hivm.hir.custom' op Unsupported user for root alloc op.
-#     Those two hunks are compiled into hivmc/bishengir-compile, so they only
-#     take effect after a rebuild (unlike the Python frontend below).
+#     Those hunks are compiled into hivmc/bishengir-compile, so they only take
+#     effect after a rebuild (unlike the Python frontend below). They are
+#     applied one patch at a time, never as a combined file (see the top of
+#     this script).
 for dir in "$INNER_NPU_DIR" "$OUTER_NPU_DIR"; do
     apply_patch "$dir" "$NPUIR_PATCH" "3rdparty/AscendNPU-IR.patch"
+    apply_patch "$dir" "$NPUIR_MEMSCOPE_PATCH" "3rdparty/AscendNPU-IR-hivm-memscope.patch"
     verify_contains "$REPO_DIR/$dir/$HIVM_TD" "UnitAttr:\$no_side_effect" \
         "hivm.hir.custom takes no_side_effect ($dir)"
     verify_contains "$REPO_DIR/$dir/$HIVM_MEMSCOPE" \

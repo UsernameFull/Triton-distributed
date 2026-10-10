@@ -311,7 +311,7 @@ inside `3rdparty/triton-ascend` (as both the build preflight and `python/setup.p
 used to), our repo-root-relative patch paths were therefore all skipped, and
 because `--check` *and* `--reverse --check` then also "succeeded", the patch was
 reported as applied while nothing had changed. The same applied to
-`3rdparty/AscendNPU-IR.patch` (whose `no_side_effect` on `hivm.hir.custom` is set
+`3rdparty/AscendNPU-IR*.patch` (whose `no_side_effect` on `hivm.hir.custom` is set
 by `lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp`).
 
 `python/setup.py`, `scripts/build_ascend_a{2,3}.sh` and `scripts/vendor_deps.sh`
@@ -355,16 +355,28 @@ distributed custom-op support (upstream `Ascend/AscendNPU-IR` `fbefed81d`, "Add
 distributed support", 2026-06-05), so its `InferHIVMMemScope` pass saw the custom
 op as an unsupported user of the root alloc and failed the whole pipeline.
 
-`3rdparty/AscendNPU-IR.patch` now backports that support (`no_side_effect` on
-`hivm.hir.custom` plus the distributed branches and
-`inferAndPropagateMemScopeForDistributed` in `InferHIVMMemScope.{h,cpp}`), and
-`scripts/build_ascend_a{2,3}.sh` verify both needles with a rebuild check, so a
-pre-fix build directory is detected. Those hunks are compiled into
+That support is backported by **two** patch files, applied (and verified) one at
+a time:
+
+* `3rdparty/AscendNPU-IR.patch` -- `no_side_effect` on `hivm.hir.custom`;
+* `3rdparty/AscendNPU-IR-hivm-memscope.patch` -- the distributed branches and
+  `inferAndPropagateMemScopeForDistributed` in `InferHIVMMemScope.{h,cpp}`.
+
+They are deliberately *not* one combined patch. `git apply` is atomic per
+invocation, so a tree that already carries only one half -- which is exactly what
+every checkout that ran the pre-split patch looks like: it has `no_side_effect`
+but not the mem-scope support -- makes a combined patch apply **nothing**, and
+then `--check` *and* `--reverse --check` both fail. `scripts/build_ascend_a{2,3}.sh`
+step 1 would `die` there, *before* step 3 ever rebuilt hivmc, so the old pipeline
+error kept coming back. Split, each half is idempotent on its own.
+
+`scripts/build_ascend_a{2,3}.sh` verify both needles (plus a rebuild stamp, so a
+pre-fix build directory is detected). Those hunks are compiled into
 hivmc/bishengir-compile, so **they only take effect after a rebuild**:
 
 ```sh
 git pull
-bash scripts/repair_ascend_triton_patch.sh   # applies + verifies the patch (both trees)
+bash scripts/repair_ascend_triton_patch.sh   # applies + verifies both patches (both trees)
 FORCE=1 bash scripts/build_ascend_a3.sh      # or build_ascend_a2.sh: rebuilds hivmc
 torchrun --nproc-per-node=2 --master_port=29501 tutorials/ascend/01-ascend-allgather-gemm.py
 ```

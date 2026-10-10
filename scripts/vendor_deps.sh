@@ -132,8 +132,10 @@ echo "python: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1))"
 # `git apply` below and in step 8 fail with "corrupt patch". A plain
 # `git checkout --` is a no-op here (CRLF worktree == LF blob counts as
 # unmodified under autocrlf), so remove the files first.
-rm -f "$ROOT/3rdparty/triton-ascend.patch" "$ROOT/3rdparty/AscendNPU-IR.patch"
-git -C "$ROOT" checkout -- 3rdparty/triton-ascend.patch 3rdparty/AscendNPU-IR.patch
+rm -f "$ROOT/3rdparty/triton-ascend.patch" "$ROOT/3rdparty/AscendNPU-IR.patch" \
+      "$ROOT/3rdparty/AscendNPU-IR-hivm-memscope.patch"
+git -C "$ROOT" checkout -- 3rdparty/triton-ascend.patch 3rdparty/AscendNPU-IR.patch \
+    3rdparty/AscendNPU-IR-hivm-memscope.patch
 if command -v nproc >/dev/null 2>&1; then
     df -h "$WORK" | tail -1
     echo "(need ~8 GB free in the scratch filesystem)"
@@ -341,7 +343,7 @@ if ! exists_skip "$INNER_NPU/CMakeLists.txt"; then
     # BISHENGIR_BUILD_STANDALONE_IR_ONLY=ON against the LLVM from step 3 and
     # never looks at npuir's own third-party/
     rm -rf "$INNER_NPU/third-party"
-    write_vendor_sha "$INNER_NPU" "$NPU_IR_URL" "$NPU_IR_SHA" "pristine; 3rdparty/AscendNPU-IR.patch applied by setup.py at build time"
+    write_vendor_sha "$INNER_NPU" "$NPU_IR_URL" "$NPU_IR_SHA" "pristine; 3rdparty/AscendNPU-IR*.patch applied by setup.py at build time"
 fi
 
 # 2b: standalone copy + its own patched/trimmed llvm-project
@@ -455,7 +457,7 @@ access** at build time. Each tree carries a \`.vendor-sha\` provenance file.
 |---|---|---|
 | \`llvm-project/\` | github.com/llvm/llvm-project | \`$LLVM_SHA\` | triton-ascend \`llvm_patch/$(basename "$LLVM_PATCH")\` **pre-applied**; trimmed to \`llvm/+mlir/+lld\` (+ monorepo-root \`cmake/\` and the out-of-tree headers \`third-party/siphash/\` and \`libunwind/include/mach-o/\`, required by \`llvm/CMakeLists.txt\`/\`llvm/lib/Support\`/\`lld/MachO\`), test suites removed (build with \`-DLLVM_INCLUDE_TESTS=OFF -DMLIR_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_BENCHMARKS=OFF\`; FileCheck is kept, llvm-lit is not built and not needed) |
 | \`triton-ascend/\` | github.com/triton-lang/triton-ascend | \`$TA_SHA\` | pristine (submodule pin; \`3rdparty/triton-ascend.patch\` applies -- verified by vendor_deps.sh and build-step preflight; setup.py applies it at build time) |
-| \`triton-ascend/third_party/ascend/AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | pristine (triton-ascend's pin; setup.py applies \`3rdparty/AscendNPU-IR.patch\`; TA cmake builds it with \`BISHENGIR_BUILD_STANDALONE_IR_ONLY=ON\`, its \`third-party/\` is not needed) |
+| \`triton-ascend/third_party/ascend/AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | pristine (triton-ascend's pin; setup.py applies \`3rdparty/AscendNPU-IR*.patch\`; TA cmake builds it with \`BISHENGIR_BUILD_STANDALONE_IR_ONLY=ON\`, its \`third-party/\` is not needed) |
 | \`AscendNPU-IR/\` | gitcode.com/Ascend/AscendNPU-IR | \`$NPU_IR_SHA\` | standalone bisheng tool build (build-step 3); its \`third-party/llvm-project\` @ \`$NPU_LLVM_SHA\` has npuir's own \`build-tools/patches/llvm-project/*.patch\` **pre-applied** and is trimmed like above (incl. root \`cmake/\`); \`third-party/torch-mlir\` intentionally absent (\`BUILD_TORCH_MLIR=OFF\`) |
 | \`shmem/\` | gitcode.com/cann/shmem | \`$SHMEM_SHA\` | pristine (submodule pin; the \`-python_extension\` path of its \`scripts/build.sh\` performs no downloads -- catlass/googletest/json are only fetched by -uttests/-examples/-python_example/-full/SOC_TYPE=Ascend950) |
 | \`nlohmann-json/\` | github.com/nlohmann/json release | v$JSON_VERSION | \`include/\` + \`single_include/\`; passed to setup.py via \`JSON_SYSPATH\` under \`TRITON_OFFLINE_BUILD=1\` |
@@ -543,7 +545,7 @@ if git -C "$ROOT" apply --reverse --check --ignore-whitespace --directory=3rdpar
 else
     echo "  [WARN] could not reverse-verify $(basename "$LLVM_PATCH") on 3rdparty/llvm-project" >&2
 fi
-# setup.py's two patches must apply to the pristine vendored trees. The form
+# setup.py's patches must apply to the pristine vendored trees. The form
 # matters: `git apply` has to run from the repo ROOT with --directory=<target>.
 # Run from inside <target>, it silently skips every entry whose patch path does
 # not start with <target>'s path below the root ("Skipped patch '<file>'") and
@@ -562,8 +564,14 @@ check_vendored_patch "$ROOT/3rdparty/triton-ascend" \
     "$ROOT/3rdparty/triton-ascend.patch" "3rdparty/triton-ascend.patch"
 check_vendored_patch "$INNER_NPU" \
     "$ROOT/3rdparty/AscendNPU-IR.patch" "3rdparty/AscendNPU-IR.patch"
+check_vendored_patch "$INNER_NPU" \
+    "$ROOT/3rdparty/AscendNPU-IR-hivm-memscope.patch" \
+    "3rdparty/AscendNPU-IR-hivm-memscope.patch"
 check_vendored_patch "$ROOT/3rdparty/AscendNPU-IR" \
     "$ROOT/3rdparty/AscendNPU-IR.patch" "3rdparty/AscendNPU-IR.patch (outer tree)"
+check_vendored_patch "$ROOT/3rdparty/AscendNPU-IR" \
+    "$ROOT/3rdparty/AscendNPU-IR-hivm-memscope.patch" \
+    "3rdparty/AscendNPU-IR-hivm-memscope.patch (outer tree)"
 exec_count=$(git ls-files -s 3rdparty | awk '$1=="100755"' | wc -l)
 echo "  exec-bit files staged under 3rdparty/: $exec_count (expect >0, e.g. npuir build-tools/*.sh)"
 [[ "$exec_count" -gt 0 ]] || fail=1

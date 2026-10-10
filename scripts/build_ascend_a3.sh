@@ -78,13 +78,13 @@
 #     AttributeError: 'triton._C.libtriton.ir.builder' object has no attribute
 #                     'create_symm_at'
 # Repair an existing tree (no rebuild) with scripts/repair_ascend_triton_patch.sh.
-# 3rdparty/AscendNPU-IR.patch is checked as well (step 1 + step 3): the pinned
-# AscendNPU-IR predates HIVM's distributed custom-op support, so the patch
-# backports it; without it hivmc rejects every kernel that calls an aclshmem
-# helper with
+# 3rdparty/AscendNPU-IR.patch and 3rdparty/AscendNPU-IR-hivm-memscope.patch are
+# checked as well (step 1 + step 3): the pinned AscendNPU-IR predates HIVM's
+# distributed custom-op support, so the patches backport it; without it hivmc
+# rejects every kernel that calls an aclshmem helper with
 #     'hivm.hir.custom' op Unsupported user for root alloc op.
 #     'func.func' op Failed to propagate memory scope for argument #N
-# and that one DOES need a rebuild (step 3) before it takes effect.
+# and those hunks DO need a rebuild (step 3) before they take effect.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -472,7 +472,8 @@ check_vendored() {  # non-zero (and logs [MISSING] lines) if 3rdparty/ is incomp
         3rdparty/shmem/scripts/build.sh \
         3rdparty/nlohmann-json/include/nlohmann/json.hpp \
         3rdparty/triton-ascend.patch \
-        3rdparty/AscendNPU-IR.patch
+        3rdparty/AscendNPU-IR.patch \
+        3rdparty/AscendNPU-IR-hivm-memscope.patch
     do
         if [[ -e "$REPO_DIR/$f" ]]; then
             echo "[OK] $f"
@@ -558,40 +559,61 @@ preflight_patch() {  # $1=target dir, $2=patch file, $3=label
     fi
 }
 preflight_patch "$TA_DIR" "$REPO_DIR/3rdparty/triton-ascend.patch" "3rdparty/triton-ascend.patch"
-preflight_patch "$INNER_NPU_DIR" "$REPO_DIR/3rdparty/AscendNPU-IR.patch" "3rdparty/AscendNPU-IR.patch"
-preflight_patch "$REPO_DIR/3rdparty/AscendNPU-IR" "$REPO_DIR/3rdparty/AscendNPU-IR.patch" \
-    "3rdparty/AscendNPU-IR.patch (outer tree, built in step 3)"
+# Each patch is preflighted SEPARATELY, on both trees. `git apply` is atomic per
+# invocation: a tree that already carries only one half of a combined patch
+# (e.g. `no_side_effect` from an older revision of that patch, which is what
+# every checkout that ran the pre-split patch looks like) makes the combined
+# patch fail to apply *entirely* -- and then BOTH `--check` and
+# `--reverse --check` fail, so "already applied" is indistinguishable from
+# "broken" and this preflight would `die` before step 3 ever rebuilt hivmc.
+NPUIR_PATCHES=(
+    "3rdparty/AscendNPU-IR.patch"
+    "3rdparty/AscendNPU-IR-hivm-memscope.patch"
+)
+for npuir_tree in "$INNER_NPU_DIR" "$REPO_DIR/3rdparty/AscendNPU-IR"; do
+    for npuir_p in "${NPUIR_PATCHES[@]}"; do
+        preflight_patch "$npuir_tree" "$REPO_DIR/$npuir_p" "$npuir_p"
+    done
+done
 
 # setup.py patches only the INNER AscendNPU-IR copy
 # (3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR), which is what the
 # root CMake build compiles. Step 3 builds hivmc / bishengir-compile from the
 # OUTER 3rdparty/AscendNPU-IR, so that tree has to carry the same changes.
-# 3rdparty/AscendNPU-IR.patch carries two things the distributed flow needs:
-#   * the `no_side_effect` unit attr on `hivm.hir.custom` (HIVMOps.td), set by
+# The distributed flow needs two independent things, carried by two patches:
+#   * 3rdparty/AscendNPU-IR.patch -- the `no_side_effect` unit attr on
+#     `hivm.hir.custom` (HIVMOps.td), set by
 #     lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp;
-#   * HIVM memory-scope support for the distributed custom ops
-#     (InferHIVMMemScope.{h,cpp}, backported from AscendNPU-IR's own
-#     "Add distributed support"). The pinned AscendNPU-IR predates it, and
-#     without it BiShengHIR rejects EVERY kernel that calls an aclshmem helper:
+#   * 3rdparty/AscendNPU-IR-hivm-memscope.patch -- HIVM memory-scope support
+#     for the distributed custom ops (InferHIVMMemScope.{h,cpp}, backported
+#     from AscendNPU-IR's own "Add distributed support"). The pinned
+#     AscendNPU-IR predates it, and without it BiShengHIR rejects EVERY kernel
+#     that calls an aclshmem helper:
 #       'hivm.hir.custom' op Unsupported user for root alloc op.
 #       'func.func' op Failed to propagate memory scope for argument #N
-# Apply it here -- again from the repo root with --directory.
+# Apply them one at a time -- again from the repo root with --directory:
+# `git apply` is atomic per invocation, so a tree that already carries only one
+# half of a combined patch would make that combined patch apply *nothing*.
+apply_npuir_patch() {  # $1=tree rel, $2=patch rel, $3=probe file rel, $4=needle
+    local rel="$1" patch="$2" probe="$3" needle="$4"
+    if grep -qF "$needle" "$REPO_DIR/$probe" 2>/dev/null; then
+        echo "[OK] $patch already applied to $rel"
+        return 0
+    fi
+    git -C "$REPO_DIR" apply --directory "$rel" "$REPO_DIR/$patch" \
+        || die "$patch does not apply to $rel -- refresh the patch (see docs/build.md 'Troubleshooting')"
+    grep -qF "$needle" "$REPO_DIR/$probe" \
+        || die "$patch did not take effect in $rel ('$needle' missing from $probe)"
+    echo "[OK] applied $patch to $rel"
+}
 apply_outer_npuir_patch() {
     local rel="3rdparty/AscendNPU-IR"
-    local td="$REPO_DIR/$rel/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
-    local memscope="$REPO_DIR/$rel/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
-    if grep -qF 'UnitAttr:$no_side_effect' "$td" 2>/dev/null \
-       && grep -qF 'inferAndPropagateMemScopeForDistributed' "$memscope" 2>/dev/null; then
-        echo "[OK] $rel already carries AscendNPU-IR.patch"
-    elif git -C "$REPO_DIR" apply --directory "$rel" "$REPO_DIR/3rdparty/AscendNPU-IR.patch"; then
-        echo "[OK] applied 3rdparty/AscendNPU-IR.patch to $rel"
-    else
-        die "3rdparty/AscendNPU-IR.patch does not apply to $rel -- refresh the patch (see docs/build.md 'Troubleshooting')"
-    fi
-    grep -qF 'UnitAttr:$no_side_effect' "$td" \
-        || die "AscendNPU-IR.patch did not take effect in $rel (no_side_effect missing from HIVMOps.td)"
-    grep -qF 'inferAndPropagateMemScopeForDistributed' "$memscope" \
-        || die "AscendNPU-IR.patch did not take effect in $rel (distributed HIVM mem-scope support missing from InferHIVMMemScope.cpp -- hivmc would reject every distributed kernel)"
+    local td="$rel/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
+    local memscope="$rel/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
+    apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR.patch" \
+        "$td" 'UnitAttr:$no_side_effect'
+    apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR-hivm-memscope.patch" \
+        "$memscope" 'inferAndPropagateMemScopeForDistributed'
 }
 apply_outer_npuir_patch
 
@@ -657,8 +679,8 @@ banner "step 3: build vendored AscendNPU-IR"
 
 NPU_SHA="$(vendor_sha "$REPO_DIR/3rdparty/AscendNPU-IR")"
 # The last clause keeps pre-fix build dirs from being reused: they were created
-# without AscendNPU-IR.patch (see apply_outer_npuir_patch), so their hivmc
-# carries neither `no_side_effect` on hivm.hir.custom nor the distributed
+# without the AscendNPU-IR patches (see apply_outer_npuir_patch), so their
+# hivmc carries neither `no_side_effect` on hivm.hir.custom nor the distributed
 # mem-scope support.
 NPUIR_TD="$NPU_IR_DIR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
 NPUIR_MEMSCOPE="$NPU_IR_DIR/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"

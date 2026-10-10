@@ -1,0 +1,178 @@
+diff --git a/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMMemScope.h b/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMMemScope.h
+index d6bbe6c5..5a751d3e 100644
+--- a/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMMemScope.h
++++ b/bishengir/include/bishengir/Dialect/HIVM/Transforms/InferHIVMMemScope.h
+@@ -50,6 +50,10 @@ LogicalResult inferAndPropagateMemScopeForMmadL1(MmadL1Op op);
+ /// \note FuncOp should be bufferized beforehand.
+ LogicalResult inferAndPropagateMemScopeForFunc(func::FuncOp op);
+ 
++/// Infer, propagate, and set memory scope information to DistributedOp.
++/// \note DistributedOp should be bufferized beforehand.
++LogicalResult inferAndPropagateMemScopeForDistributed(hivm::CustomOp op);
++
+ /// Infer, propagate, and set memory scope information to PointerCastOp.
+ LogicalResult inferAndPropagateMemScopeForPointerCast(hivm::PointerCastOp op);
+ 
+diff --git a/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp b/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp
+index 1f7b8a38..133274da 100644
+--- a/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp
++++ b/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp
+@@ -54,9 +54,21 @@ bool isSingleResultPropagatableMemrefOp(Operation *op) {
+     return true;
+   if (isa<bishengir::memref_ext::AllocWorkspaceOp>(op))
+     return true;
++  if (isa<UnrealizedConversionCastOp>(op))
++    return true;
+   return false;
+ }
+ 
++/// Distributed shmem/HIVM custom ops are the `hivm.hir.custom` ops that the
++/// Triton-distributed -> HIVM conversion marks with `hivm.is_distributed`
++/// (aclshmem pointer lookup, signals, tokens, ...). They are opaque device
++/// calls whose memrefs live in GM by construction, so the scope inference
++/// below has to treat them like a `func.call` instead of a view-like op.
++bool isDistributedTypeCustomOp(Operation *op) {
++  return op && llvm::isa<hivm::CustomOp>(op) &&
++         op->hasAttr("hivm.is_distributed");
++}
++
+ static BlockArgument getTiedWhileBodyIterArg(scf::WhileOp op, OpOperand *opOperand) {
+   auto argsMutable = op.getInitsMutable();
+   auto *it = llvm::find(argsMutable, *opOperand);
+@@ -73,6 +85,27 @@ MemScopeInferAndPropagateHelper::propagateMemScopeToUsers(Value val) {
+   // This function propagates the type change of an SSA result to the operation
+   // that uses it. The result type of the updated operation might be affected,
+   // so we need to cascade the change.
++  // Default handler for operations that need memory scope propagation.
++  auto defaultPropagateFn = [&](Operation *op) -> LogicalResult {
++    // Don't need to update Ops that don't have results.
++    if (op->getNumResults() == 0) {
++      return success();
++    }
++    // Or results that are not memrefs.
++    if (llvm::none_of(op->getResults(), [&](OpResult result) {
++          return isa<MemRefType>(result.getType());
++        })) {
++      return success();
++    }
++    if (op->getNumResults() == 1 && isSingleResultPropagatableMemrefOp(op)) {
++      auto result = op->getResult(0);
++      setBaseMemRefTypeScope(result, memrefScope);
++      return propagateMemScopeToUsers(result);
++    }
++    op->emitOpError("Unsupported user for root alloc op.");
++    return failure();
++  };
++
+   auto propagateFn = [&](OpOperand &user) -> LogicalResult {
+     Operation *userDefiningOp = user.getOwner();
+     return TypeSwitch<Operation *, LogicalResult>(userDefiningOp)
+@@ -116,26 +149,16 @@ MemScopeInferAndPropagateHelper::propagateMemScopeToUsers(Value val) {
+           // for the results.
+           return success();
+         })
+-        .Default([&](Operation *op) {
+-          // Don't need to update Ops that don't have results.
+-          if (op->getNumResults() == 0) {
+-            return success();
+-          }
+-          // Or results that are not memrefs.
+-          if (llvm::none_of(op->getResults(), [&](OpResult result) {
+-                return isa<MemRefType>(result.getType());
+-              })) {
+-            return success();
++        .Case<hivm::CustomOp>([&](hivm::CustomOp op) {
++          // Only handle distributed custom ops, otherwise fall through to
++          // default.
++          if (!isDistributedTypeCustomOp(op)) {
++            return defaultPropagateFn(op);
+           }
+-          if (op->getNumResults() == 1 &&
+-              isSingleResultPropagatableMemrefOp(op)) {
+-            auto result = op->getResult(0);
+-            setBaseMemRefTypeScope(result, memrefScope);
+-            return propagateMemScopeToUsers(result);
+-          }
+-          op->emitOpError("Unsupported user for root alloc op.");
+-          return failure();
+-        });
++          // Distributed CustomOp is just a func Call
++          return success();
++        })
++        .Default(defaultPropagateFn);
+   };
+   // Iterate over the users of the val.
+   for (OpOperand &user : val.getUses()) {
+@@ -390,6 +413,53 @@ LogicalResult hivm::inferAndPropagateMemScopeForFunc(func::FuncOp op) {
+   return success();
+ }
+ 
++LogicalResult hivm::inferAndPropagateMemScopeForDistributed(hivm::CustomOp op) {
++  auto gmSpaceAttr =
++      AddressSpaceAttr::get(op->getContext(), hivm::AddressSpace::GM);
++  LDBG("Begin infer and propagate memory scope for distributed func"
++       << op.getSymbol());
++  // For operands (actual SSA values) propagate GM scope to their root.
++  MemScopeInferAndPropagateHelper helper;
++  for (Value in : op.getInputs()) {
++    if (!isa<BaseMemRefType>(in.getType()))
++      continue;
++    if (auto memrefType = dyn_cast<BaseMemRefType>(in.getType())) {
++      if (memrefType.getMemorySpace())
++        continue;
++    }
++    // Trace back and set its scope to GM.
++    if (failed(helper.Run(utils::tracebackMemRef(in), gmSpaceAttr))) {
++      return op->emitOpError()
++             << "Failed to propagate memory scope for operand " << in;
++    }
++  }
++  // Also propagate GM scope to output init operands (the buffers provided
++  // as outputs) so their root allocs get marked.
++  for (Value out : op.getOutputs()) {
++    if (!isa<BaseMemRefType>(out.getType()))
++      continue;
++    if (auto memrefType = dyn_cast<BaseMemRefType>(out.getType())) {
++      if (memrefType.getMemorySpace())
++        continue;
++    }
++    if (failed(helper.Run(utils::tracebackMemRef(out), gmSpaceAttr))) {
++      return op->emitOpError()
++             << "Failed to propagate memory scope for output operand " << out;
++    }
++  }
++  // For extern functions that have results, we assume that the memory scope
++  // is Global Memory.
++  for (auto result : op->getResults()) {
++    if (!isa<BaseMemRefType>(result.getType()))
++      continue;
++    if (failed(helper.Run(result, gmSpaceAttr))) {
++      return op->emitOpError()
++             << "Failed to propagate memory scope for result " << result;
++    }
++  }
++  return success();
++}
++
+ LogicalResult
+ hivm::inferAndPropagateMemScopeForPointerCast(hivm::PointerCastOp op) {
+   LDBG("Begin infer and propagate memory scope for:" << op);
+@@ -449,6 +519,18 @@ void InferHIVMMemScopePass::runOnOperation() {
+     if (failed(hivm::inferAndPropagateMemScopeForFunc(func)))
+       signalPassFailure();
+ 
++    // Distributed custom ops (hivm.hir.custom with `hivm.is_distributed`) are
++    // opaque device calls whose memrefs live in GM, so mark their memref
++    // operands/results explicitly -- otherwise the "remaining alloc" walk at
++    // the end of this loop would default their root allocs to UB/L1.
++    func->walk([&](hivm::CustomOp op) {
++      if (isDistributedTypeCustomOp(op)) {
++        if (failed(hivm::inferAndPropagateMemScopeForDistributed(op))) {
++          signalPassFailure();
++        }
++      }
++    });
++
+     // Propagate the memory scope by the pointer cast's annotation mark
+     func->walk([&](hivm::PointerCastOp op) {
+       if (failed(hivm::inferAndPropagateMemScopeForPointerCast(op)))
