@@ -295,6 +295,41 @@ causes of `-11`:
   installs and verifies the resolved `libtriton`, and the triage log prints the
   `__file__` of every relevant module so you can confirm.
 
+#### Troubleshooting: `'triton._C.libtriton.ir.builder' object has no attribute 'create_symm_at'`
+
+The kernel reached the AST -> TTIR frontend and `dl.symm_at(...)` was called on a
+plain `ir.builder`: `3rdparty/triton-ascend.patch` is not applied to the runtime
+triton tree. That patch is what makes the frontend build
+`distributed.ir.DistributedOpBuilder` (where `create_symm_at`, `create_get_rank`,
+`create_notify`, ... live) and registers the distributed dialects and the
+distributed->HIVM pass.
+
+The failure used to be **silent**. `git apply` resolves patch paths against the
+*current working directory* and skips -- printing `Skipped patch '<file>'`, with
+exit status still 0 -- every entry that does not live below it. Applied from
+inside `3rdparty/triton-ascend` (as both the build preflight and `python/setup.py`
+used to), our repo-root-relative patch paths were therefore all skipped, and
+because `--check` *and* `--reverse --check` then also "succeeded", the patch was
+reported as applied while nothing had changed. The same applied to
+`3rdparty/AscendNPU-IR.patch` (whose `no_side_effect` on `hivm.hir.custom` is set
+by `lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp`).
+
+`python/setup.py`, `scripts/build_ascend_a{2,3}.sh` and `scripts/vendor_deps.sh`
+now run `git apply --directory=<target>` from the repository root *and* verify the
+result by content, so a silently skipped patch fails the build instead of failing
+your kernel. To repair an existing checkout (no rebuild needed for the Python
+frontend):
+
+```sh
+bash scripts/repair_ascend_triton_patch.sh
+# RESET=1 bash scripts/repair_ascend_triton_patch.sh   # also git-restore a tree
+#                                                     # the patch no longer applies to
+```
+
+`scripts/probe_ascend_language_api.py` (run by the build's step 6) and
+`scripts/build_ascend_a{2,3}.sh` step 4 now check for exactly this, so a fresh
+build reports it as an error rather than at kernel-launch time.
+
 If the ladder blames the compiler layer, capture the MLIR dump for a bug report:
 
 ```sh

@@ -107,32 +107,68 @@ class Backend:
     dist_language_dir: Optional[str]
 
 
-def apply_vendored_patch(target_dir, patch_path, label: str):
-    """Apply a vendored git patch under ``target_dir`` unless it is already applied.
+def apply_vendored_patch(target_dir, patch_path, label: str, required=()):
+    """Apply a vendored git patch to ``target_dir`` unless it is already applied.
 
-    The previous gate used ``git diff-index --quiet HEAD`` -- a plumbing command
-    that reports CRLF/stat-cache noise as modifications -- so any checkout with
-    unrelated local changes (e.g. a Windows CRLF working tree) silently skipped
-    the patch and then failed cryptically deep inside the C++ build (missing
-    headers such as TritonAMDGPUToLLVM/TargetUtils.h).  Mirror the preflight in
-    scripts/build_ascend_a3.sh instead: apply whenever the patch actually
-    applies, skip when it is already applied, and only warn when it conflicts
-    with local edits.
+    Two traps, either of which used to turn this into a *silent* no-op:
+
+    * ``git apply`` resolves the patch paths against the **current working
+      directory**: entries that do not live below it are skipped with
+      ``Skipped patch '<file>'.`` on stdout -- and the exit status is still 0.
+      Running it with ``cwd=target_dir`` therefore applied nothing at all for
+      patches whose paths are relative to the repository root
+      (``3rdparty/triton-ascend.patch``, ``3rdparty/AscendNPU-IR.patch``), and
+      ``--check`` *and* ``--reverse --check`` both returned 0, so the patch also
+      looked "already applied".  Run it from the repository root with
+      ``--directory=<target_dir>`` instead.
+    * because the exit codes cannot be trusted, ``required`` lists
+      ``(relative_path, needle)`` pairs that are checked *after* the apply.
+      A missing needle aborts the install instead of producing a libtriton
+      without the distributed frontend, which only shows up much later as
+      ``AttributeError: 'triton._C.libtriton.ir.builder' object has no
+      attribute 'create_symm_at'``.
+
+    Historical note: the gate used to be ``git diff-index --quiet HEAD`` -- a
+    plumbing command that reports CRLF/stat-cache noise as modifications -- so
+    any checkout with unrelated local changes silently skipped the patch and
+    then failed cryptically deep inside the C++ build (missing headers such as
+    TritonAMDGPUToLLVM/TargetUtils.h).
     """
+    repo_root = get_base_dir()
+    rel_target = os.path.relpath(str(target_dir), repo_root).replace(os.sep, "/")
+    patch_path = str(patch_path)
 
-    def _check(*args):
-        return subprocess.call(["git", "apply", *args], cwd=target_dir,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def _git_apply(*args):
+        return subprocess.call(
+            ["git", "-C", repo_root, "apply", "--directory", rel_target, *args, patch_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    name = os.path.basename(str(patch_path))
-    if _check("--check", patch_path) == 0:
-        subprocess.check_call(["git", "apply", patch_path], cwd=target_dir)
-        print(f"[patches] {label}: applied {name}")
-    elif _check("--reverse", "--check", patch_path) == 0:
+    name = os.path.basename(patch_path)
+    if _git_apply("--check") == 0:
+        subprocess.check_call(
+            ["git", "-C", repo_root, "apply", "--directory", rel_target, patch_path])
+        print(f"[patches] {label}: applied {name} -> {rel_target}")
+    elif _git_apply("--reverse", "--check") == 0:
         print(f"[patches] {label}: {name} already applied, skipping")
     else:
         print(f"[patches][WARN] {label}: {name} neither applies nor is already "
               f"applied -- leaving the tree unpatched (the build may fail)")
+
+    for rel_file, needle in required:
+        path = os.path.join(str(target_dir), rel_file)
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read().decode("utf-8", "replace")
+        except OSError as exc:
+            raise RuntimeError(f"[patches] {label}: cannot read {path}: {exc}") from exc
+        if needle not in body:
+            raise RuntimeError(
+                f"[patches] {label}: {rel_file} does not contain {needle!r} after "
+                f"applying {name} -- the patch did not take effect (a `git apply` run "
+                f"from the wrong directory prints \"Skipped patch\" and exits 0). "
+                f"Refusing to build a libtriton without the distributed frontend; repair "
+                f"with `scripts/repair_ascend_triton_patch.sh` (Ascend) and re-run.")
+        print(f"[patches] {label}: verified {rel_file} carries {needle!r}")
 
 
 class BackendInstaller:
@@ -159,8 +195,21 @@ class BackendInstaller:
                 npuir_path = TA_dir / "third_party/ascend/AscendNPU-IR"
                 TA_patch = TA_dir / "../triton-ascend.patch"
                 npuir_patch = TA_dir / "../AscendNPU-IR.patch"
-                apply_vendored_patch(TA_dir, TA_patch, "triton-ascend")
-                apply_vendored_patch(npuir_path, npuir_patch, "AscendNPU-IR")
+                # `required` pins down the parts of each patch the Ascend build
+                # cannot work without, so a silently-skipped `git apply` fails
+                # here instead of at runtime (see apply_vendored_patch).
+                apply_vendored_patch(TA_dir, TA_patch, "triton-ascend", required=(
+                    ("python/triton/compiler/code_generator.py",
+                     "distributed.ir.DistributedOpBuilder"),
+                    ("python/triton/compiler/compiler.py",
+                     "distributed.ir.load_dialects"),
+                    ("third_party/ascend/backend/compiler.py",
+                     "add_convert_triton_distributed_to_hivm"),
+                ))
+                apply_vendored_patch(npuir_path, npuir_patch, "AscendNPU-IR", required=(
+                    ("bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td",
+                     "UnitAttr:$no_side_effect"),
+                ))
 
             backend_src_dir = os.path.join(root_dir, backend_name)
 

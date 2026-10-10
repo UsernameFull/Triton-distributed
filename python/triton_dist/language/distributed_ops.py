@@ -68,6 +68,29 @@ def _str_to_dist_comm_scopre(comm_scope):
     return scope
 
 
+def _dist_builder_op(builder, name):
+    """Look up a distributed builder op (``create_symm_at``, ``create_get_rank``, ...).
+
+    Those methods are registered on ``DistributedOpBuilder`` by Triton-distributed's
+    own ``python/src/ir.cc``; they only reach the frontend once
+    ``3rdparty/triton-ascend.patch`` has swapped the plain ``ir.builder`` for
+    ``distributed.ir.DistributedOpBuilder`` in ``triton/compiler/code_generator.py``.
+    When that patch is missing the plain builder is active and each call below
+    would die with a bare ``AttributeError: 'triton._C.libtriton.ir.builder'
+    object has no attribute 'create_symm_at'`` -- report the real cause instead.
+    """
+    op = getattr(builder, name, None)
+    if op is None:
+        raise RuntimeError(
+            f"the active Triton builder ({type(builder).__name__}) has no {name}(): the "
+            "distributed frontend is not wired up. This happens when "
+            "3rdparty/triton-ascend.patch did not land on the runtime triton tree, so "
+            "triton/compiler/code_generator.py still builds a plain `ir.builder`. Fix on "
+            "Ascend: `bash scripts/repair_ascend_triton_patch.sh` (no rebuild needed); "
+            "else re-install this checkout with `pip install -e ./python`.")
+    return op
+
+
 @builtin
 def wait(barrierPtrs, numBarriers, scope: str, semantic: str, waitValue: int = 1, _semantic=None):
     if not barrierPtrs.type.scalar.is_ptr():
@@ -79,16 +102,17 @@ def wait(barrierPtrs, numBarriers, scope: str, semantic: str, waitValue: int = 1
     waitValue = _semantic._convert_elem_to_ir_value(waitValue, require_i64=require_i64)
     scope = _semantic._str_to_scope(scope)
     semantic = _semantic._str_to_sem(semantic)
+    builder = _dist_builder_op(_semantic.builder, "create_distributed_wait")
     return tlc.tensor(
-        _semantic.builder.create_distributed_wait(barrierPtrs.handle,
-                                                  _semantic.to_tensor(numBarriers).handle, waitValue, scope, semantic,
-                                                  tlc.int32.to_ir(_semantic.builder)), tlc.int32)
+        builder(barrierPtrs.handle, _semantic.to_tensor(numBarriers).handle, waitValue, scope, semantic,
+                tlc.int32.to_ir(_semantic.builder)), tlc.int32)
 
 
 @builtin
 def consume_token(value, token, _semantic=None):
     assert token.type.scalar.is_int(), "token must be of int type"
-    handle = _semantic.builder.create_distributed_consume_token(value.handle, token.handle)
+    builder_op = _dist_builder_op(_semantic.builder, "create_distributed_consume_token")
+    handle = builder_op(value.handle, token.handle)
     if isinstance(value, tlc.tensor_descriptor):
         return tlc.tensor_descriptor(handle, value.shape, value.strides, value.block_type)
     else:
@@ -98,20 +122,21 @@ def consume_token(value, token, _semantic=None):
 @builtin
 def rank(axis=-1, _semantic=None):
     axis = _semantic._convert_elem_to_ir_value(axis, require_i64=False)
-    return tlc.tensor(_semantic.builder.create_get_rank(axis), tlc.int32)
+    return tlc.tensor(_dist_builder_op(_semantic.builder, "create_get_rank")(axis), tlc.int32)
 
 
 @builtin
 def num_ranks(axis=-1, _semantic=None):
     axis = _semantic._convert_elem_to_ir_value(axis, require_i64=False)
-    return tlc.tensor(_semantic.builder.create_get_num_ranks(axis), tlc.int32)
+    return tlc.tensor(_dist_builder_op(_semantic.builder, "create_get_num_ranks")(axis), tlc.int32)
 
 
 @builtin
 def symm_at(ptr, rank, _semantic=None):
     assert not ptr.type.is_block() and ptr.type.is_ptr(), "only support scalar pointer"
     rank = _semantic._convert_elem_to_ir_value(rank, require_i64=False)
-    return tlc.tensor(_semantic.builder.create_symm_at(ptr.handle, rank), ptr.type)
+    return tlc.tensor(
+        _dist_builder_op(_semantic.builder, "create_symm_at")(ptr.handle, rank), ptr.type)
 
 
 @builtin
@@ -123,4 +148,6 @@ def notify(ptr, rank, signal=1, sig_op="set", comm_scope="inter_node", _semantic
     signal = _semantic._convert_elem_to_ir_value(signal, require_i64=True)
     sig_op = _str_to_dist_signal_op(sig_op)
     comm_scope = _str_to_dist_comm_scopre(comm_scope)
-    return tlc.tensor(_semantic.builder.create_notify(ptr.handle, signal, rank, sig_op, comm_scope), tlc.void)
+    return tlc.tensor(
+        _dist_builder_op(_semantic.builder, "create_notify")(ptr.handle, signal, rank, sig_op, comm_scope),
+        tlc.void)

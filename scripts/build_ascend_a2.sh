@@ -119,6 +119,11 @@
 # libtriton.so carries the `distributed` backend), and then verifies it.
 # Skipping that removal is what makes a successful build fail at runtime with
 #     triton._C.libtriton is not a package
+# The same verification covers 3rdparty/triton-ascend.patch: without it the
+# frontend builds a plain `ir.builder` and the first `dl.symm_at(...)` dies with
+#     AttributeError: 'triton._C.libtriton.ir.builder' object has no attribute
+#                     'create_symm_at'
+# Repair an existing tree (no rebuild) with scripts/repair_ascend_triton_patch.sh.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -337,6 +342,53 @@ from triton._C.libtriton.distributed import ir as _distributed_ir  # noqa: F401
 from triton._C.libtriton.distributed import ascend_passes as _ascend_passes  # noqa: F401
 print("[triton] triton._C.libtriton.distributed.{ir,ascend_passes} importable")
 
+# The vendored 3rdparty/triton-ascend.patch is what makes the *frontend* build a
+# DistributedOpBuilder: code_generator.py swaps the plain `ir.builder` (which has
+# no create_symm_at/create_get_rank/...) for `distributed.ir.DistributedOpBuilder`,
+# compiler.py registers the distributed dialects, and the ascend backend adds the
+# distributed->HIVM pass. If the patch did not land, the build still "succeeds"
+# and the first `dl.symm_at(...)` in a kernel dies with
+#   AttributeError: 'triton._C.libtriton.ir.builder' object has no attribute
+#                   'create_symm_at'
+# End of the build is the last cheap place to catch that, so check the *runtime*
+# tree here instead of during kernel triage.
+if not hasattr(_distributed_ir, "DistributedOpBuilder"):
+    sys.exit(
+        "ERROR: triton._C.libtriton.distributed.ir has no DistributedOpBuilder --\n"
+        "       the loaded libtriton.so is missing the distributed frontend ops."
+    )
+
+triton_pkg = os.path.dirname(os.path.abspath(triton.__file__))
+frontend_needles = (
+    ("compiler/code_generator.py", "distributed.ir.DistributedOpBuilder"),
+    ("compiler/compiler.py", "distributed.ir.load_dialects"),
+    ("backends/ascend/backend/compiler.py", "add_convert_triton_distributed_to_hivm"),
+)
+unpatched = []
+for rel, needle in frontend_needles:
+    path = os.path.join(triton_pkg, rel)
+    try:
+        with open(path, "rb") as handle:
+            body = handle.read().decode("utf-8", "replace")
+    except OSError as exc:
+        unpatched.append(f"{rel} ({exc})")
+        continue
+    if needle not in body:
+        unpatched.append(rel)
+if unpatched:
+    sys.exit(
+        "ERROR: the runtime triton tree does NOT carry 3rdparty/triton-ascend.patch:\n"
+        + "".join(f"         - {name}\n" for name in unpatched)
+        + f"         (triton package: {triton_pkg})\n"
+        "       Without it the frontend builds a plain `ir.builder`, and the first\n"
+        "       dl.symm_at(...) fails with\n"
+        "         AttributeError: 'triton._C.libtriton.ir.builder' object has no\n"
+        "                         attribute 'create_symm_at'\n"
+        "       Fix: bash scripts/repair_ascend_triton_patch.sh   (the Python side\n"
+        "       needs no rebuild -- re-run the tutorial straight after)"
+    )
+print("[triton] frontend patch applied: DistributedOpBuilder + distributed passes")
+
 # Soft check: the full user-facing import chain (torch/torch_npu are heavy).
 try:
     import triton_dist.language  # noqa: F401
@@ -554,27 +606,61 @@ echo "vendored LLVM: $LLVM_SHA (triton-ascend expects $HASH_SHA)"
 [[ "$LLVM_SHA" == "$HASH_SHA" || "$LLVM_SHA" == "unknown" ]] \
     || echo "[WARN] vendored LLVM commit differs from triton-ascend's cmake/llvm-hash.txt"
 
-# setup.py git-applies these two patches during step 4 whenever they actually
-# apply (it no longer requires a pristine `git diff-index` tree, which plumbing
-# reports as dirty for CRLF/stat-cache noise). Mirror that decision here (cheap)
-# instead of after the ~1h LLVM build, and still hard-fail on a clean tree so a
-# stale/incompatible 3rdparty/*.patch is caught up front.
+# setup.py git-applies these two patches during step 4 -- from the repository
+# ROOT, with `git apply --directory=<target>`. That combination matters:
+# `git apply` resolves patch paths against the *current directory* and silently
+# skips ("Skipped patch '<file>'", on stdout) every entry that does not live
+# below it, while STILL exiting 0 -- so with `cwd=<target>` our repo-root-relative
+# patch paths skipped everything, and `--check` *and* `--reverse --check` both
+# reported success. That is exactly how both vendored patches used to no-op while
+# looking applied; the first symptom is a kernel that reaches the frontend and
+# dies with
+#   AttributeError: 'triton._C.libtriton.ir.builder' object has no attribute
+#                   'create_symm_at'
+# Mirror the fixed decision here (cheap) instead of after the ~1h LLVM build.
+patch_target_rel() {  # $1 = absolute dir under $REPO_DIR -> path relative to it
+    echo "${1#"$REPO_DIR"/}"
+}
 preflight_patch() {  # $1=target dir, $2=patch file, $3=label
-    local out
-    if out=$(git -C "$1" apply --check "$2" 2>&1); then
-        echo "[OK] $3 applies cleanly"
-    elif git -C "$1" apply --reverse --check "$2" 2>/dev/null; then
-        echo "[OK] $3 already applied (re-run with patched tree)"
-    elif git -C "$1" diff-index --quiet HEAD -- 2>/dev/null; then
-        echo "[ERROR] $3 does NOT apply to the clean vendored tree:" >&2
-        echo "$out" >&2
-        die "$3 incompatible with 3rdparty/triton-ascend -- re-run scripts/vendor_deps.sh or refresh 3rdparty/*.patch"
+    local out rel
+    rel="$(patch_target_rel "$1")"
+    if out=$(git -C "$REPO_DIR" apply --directory "$rel" --check "$2" 2>&1); then
+        echo "[OK] $3 applies cleanly (target: $rel)"
+    elif git -C "$REPO_DIR" apply --directory "$rel" --reverse --check "$2" 2>/dev/null; then
+        echo "[OK] $3 already applied (target: $rel)"
     else
-        echo "[WARN] $3 neither applies nor is already applied -- repo has unrelated modifications; setup.py will skip patching it"
+        echo "[ERROR] $3 does NOT apply to $rel:" >&2
+        echo "$out" >&2
+        die "$3 neither applies nor is already applied in $rel -- refresh 3rdparty/*.patch, or repair the tree (see docs/build.md 'Troubleshooting')"
     fi
 }
 preflight_patch "$TA_DIR" "$REPO_DIR/3rdparty/triton-ascend.patch" "3rdparty/triton-ascend.patch"
 preflight_patch "$INNER_NPU_DIR" "$REPO_DIR/3rdparty/AscendNPU-IR.patch" "3rdparty/AscendNPU-IR.patch"
+preflight_patch "$REPO_DIR/3rdparty/AscendNPU-IR" "$REPO_DIR/3rdparty/AscendNPU-IR.patch" \
+    "3rdparty/AscendNPU-IR.patch (outer tree, built in step 3)"
+
+# setup.py patches only the INNER AscendNPU-IR copy
+# (3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR), which is what the
+# root CMake build compiles. Step 3 builds hivmc / bishengir-compile from the
+# OUTER 3rdparty/AscendNPU-IR, which must carry the same HIVM op definition
+# (`UnitAttr:$no_side_effect` on `hivm.hir.custom`, emitted by
+# lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp), so
+# apply it here -- again from the repo root with --directory.
+apply_outer_npuir_patch() {
+    local rel="3rdparty/AscendNPU-IR"
+    local td="$REPO_DIR/$rel/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
+    local needle='UnitAttr:$no_side_effect'
+    if grep -qF "$needle" "$td" 2>/dev/null; then
+        echo "[OK] $rel already carries AscendNPU-IR.patch"
+    elif git -C "$REPO_DIR" apply --directory "$rel" "$REPO_DIR/3rdparty/AscendNPU-IR.patch"; then
+        echo "[OK] applied 3rdparty/AscendNPU-IR.patch to $rel"
+    else
+        die "3rdparty/AscendNPU-IR.patch does not apply to $rel -- refresh the patch (see docs/build.md 'Troubleshooting')"
+    fi
+    grep -qF "$needle" "$td" \
+        || die "AscendNPU-IR.patch did not take effect in $rel (no_side_effect missing from HIVMOps.td)"
+}
+apply_outer_npuir_patch
 
 # ---------------------------------------------------------------------------
 # step 2: build LLVM (vendored, patch pre-applied, out-of-source)
@@ -637,10 +723,19 @@ STEP=3-npu-ir
 banner "step 3: build vendored AscendNPU-IR"
 
 NPU_SHA="$(vendor_sha "$REPO_DIR/3rdparty/AscendNPU-IR")"
+# The last clause keeps pre-fix build dirs from being reused: they were created
+# without AscendNPU-IR.patch (see apply_outer_npuir_patch), so their hivmc
+# carries no `no_side_effect` on hivm.hir.custom.
+NPUIR_TD="$NPU_IR_DIR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
+NPUIR_PATCHED=0
+if grep -qF 'UnitAttr:$no_side_effect' "$NPUIR_TD" 2>/dev/null; then
+    NPUIR_PATCHED=1
+fi
 if [[ "$FORCE" != "1" && -f "$WORK_ROOT/.stamp_npu_ir" \
       && "$(cat "$WORK_ROOT/.stamp_npu_ir")" == "$NPU_SHA" \
       && -d "$NPU_IR_DIR/build/bin" \
-      && -f "$NPU_IR_DIR/build/lib/meta_op.aic.bc" ]]; then
+      && -f "$NPU_IR_DIR/build/lib/meta_op.aic.bc" \
+      && "$NPUIR_PATCHED" == "1" ]]; then
     echo "AscendNPU-IR $NPU_SHA already built (stamp matches), skipping. FORCE=1 to rebuild."
 else
     : "${ASCEND_HOME_PATH:?CANN set_env.sh did not define ASCEND_HOME_PATH -- check CANN_ENV}"

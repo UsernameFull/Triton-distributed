@@ -543,17 +543,27 @@ if git -C "$ROOT" apply --reverse --check --ignore-whitespace --directory=3rdpar
 else
     echo "  [WARN] could not reverse-verify $(basename "$LLVM_PATCH") on 3rdparty/llvm-project" >&2
 fi
-# setup.py's two patches must apply to the pristine vendored trees
-if (cd "$ROOT/3rdparty/triton-ascend" && git apply --check "$ROOT/3rdparty/triton-ascend.patch"); then
-    echo "  [OK] 3rdparty/triton-ascend.patch applies to vendored triton-ascend"
-else
-    echo "  [FAIL] 3rdparty/triton-ascend.patch does NOT apply" >&2; fail=1
-fi
-if (cd "$INNER_NPU" && git apply --check "$ROOT/3rdparty/AscendNPU-IR.patch"); then
-    echo "  [OK] 3rdparty/AscendNPU-IR.patch applies to vendored inner AscendNPU-IR"
-else
-    echo "  [FAIL] 3rdparty/AscendNPU-IR.patch does NOT apply" >&2; fail=1
-fi
+# setup.py's two patches must apply to the pristine vendored trees. The form
+# matters: `git apply` has to run from the repo ROOT with --directory=<target>.
+# Run from inside <target>, it silently skips every entry whose patch path does
+# not start with <target>'s path below the root ("Skipped patch '<file>'") and
+# still exits 0 -- a bogus [OK] here, and a no-op patch at build time.
+check_vendored_patch() {  # $1 = target dir (absolute, under $ROOT) $2 = patch $3 = label
+    local rel="${1#"$ROOT"/}"
+    if git -C "$ROOT" apply --directory "$rel" --check "$2" 2>/dev/null; then
+        echo "  [OK] $3 applies to $1"
+    elif git -C "$ROOT" apply --directory "$rel" --reverse --check "$2" 2>/dev/null; then
+        echo "  [OK] $1 already carries $3"
+    else
+        echo "  [FAIL] $3 does NOT apply to $1" >&2; fail=1
+    fi
+}
+check_vendored_patch "$ROOT/3rdparty/triton-ascend" \
+    "$ROOT/3rdparty/triton-ascend.patch" "3rdparty/triton-ascend.patch"
+check_vendored_patch "$INNER_NPU" \
+    "$ROOT/3rdparty/AscendNPU-IR.patch" "3rdparty/AscendNPU-IR.patch"
+check_vendored_patch "$ROOT/3rdparty/AscendNPU-IR" \
+    "$ROOT/3rdparty/AscendNPU-IR.patch" "3rdparty/AscendNPU-IR.patch (outer tree)"
 exec_count=$(git ls-files -s 3rdparty | awk '$1=="100755"' | wc -l)
 echo "  exec-bit files staged under 3rdparty/: $exec_count (expect >0, e.g. npuir build-tools/*.sh)"
 [[ "$exec_count" -gt 0 ]] || fail=1

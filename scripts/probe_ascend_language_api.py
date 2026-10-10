@@ -103,6 +103,52 @@ def probe_libtriton_backends():
     else:
         report("from triton._C.libtriton.distributed import ir", True)
 
+    probe_frontend_patch()
+
+
+def probe_frontend_patch():
+    """The vendored ``3rdparty/triton-ascend.patch`` must have been applied to the
+    *runtime* triton tree.
+
+    It is what makes the frontend build a ``DistributedOpBuilder`` instead of the
+    plain ``ir.builder`` (see ``compiler/code_generator.py``); the distributed
+    builder ops -- ``create_symm_at``, ``create_get_rank``, ``create_notify``,
+    ... -- live there. When the patch is missing, the build still "succeeds" and
+    the first ``dl.symm_at(...)`` in a kernel dies with
+      AttributeError: 'triton._C.libtriton.ir.builder' object has no attribute
+                      'create_symm_at'
+    ``git apply`` no-ops silently (exit 0, "Skipped patch ...") when it is run
+    with the wrong working directory, so check the result, not the exit code.
+    """
+    import triton
+
+    pkg = os.path.dirname(os.path.abspath(triton.__file__))
+    checks = (
+        ("compiler/code_generator.py", "distributed.ir.DistributedOpBuilder"),
+        ("compiler/compiler.py", "distributed.ir.load_dialects"),
+        ("backends/ascend/backend/compiler.py", "add_convert_triton_distributed_to_hivm"),
+    )
+    for rel, needle in checks:
+        path = os.path.join(pkg, rel)
+        try:
+            with open(path, "rb") as handle:
+                body = handle.read().decode("utf-8", "replace")
+        except OSError as exc:
+            report(f"{rel} carries the distributed frontend patch", False, repr(exc))
+            continue
+        report(f"{rel} carries the distributed frontend patch", needle in body,
+               "" if needle in body else
+               "3rdparty/triton-ascend.patch is not applied -- fix: "
+               "bash scripts/repair_ascend_triton_patch.sh")
+
+    try:
+        from triton._C.libtriton.distributed import ir as distributed_ir
+    except Exception as exc:  # noqa: BLE001
+        report("distributed.ir.DistributedOpBuilder", False, repr(exc))
+    else:
+        report("distributed.ir.DistributedOpBuilder",
+               hasattr(distributed_ir, "DistributedOpBuilder"))
+
 
 def probe_symbols():
     print()
