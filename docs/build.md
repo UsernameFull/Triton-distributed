@@ -223,7 +223,8 @@ The script checks prerequisites (npu-smi, CANN env, torch/torch_npu, pybind11,
 clang/lld, cmake>=3.28, ninja>=1.12), then builds in order: the vendored LLVM
 (`3rdparty/llvm-project`, triton-ascend's llvm patch pre-applied, built with
 tests disabled), AscendNPU-IR/bisheng (from a `WORK_ROOT` copy of
-`3rdparty/AscendNPU-IR`, its own llvm patches pre-applied), Triton-distributed
+`3rdparty/AscendNPU-IR`, its own llvm patches pre-applied), the SHMEM device
+bitcode consumed by distributed kernels, Triton-distributed
 (`pip install -e ./python` with `TRITON_USE_ASCEND=ON TRITON_OFFLINE_BUILD=1
 JSON_SYSPATH=3rdparty/nlohmann-json LLVM_SYSPATH=...`) and the shmem python
 extension, finishing with `scripts/probe_ascend_language_api.py`. See the
@@ -355,8 +356,8 @@ distributed custom-op support (upstream `Ascend/AscendNPU-IR` `fbefed81d`, "Add
 distributed support", 2026-06-05), so its `InferHIVMMemScope` pass saw the custom
 op as an unsupported user of the root alloc and failed the whole pipeline.
 
-That support, plus the follow-up `Not bufferized.` fix, is backported by **four**
-patch files, applied (and verified) one at a time:
+That support, plus the follow-up `Not bufferized.` and extra-buffer fixes, is
+backported by **five** patch files, applied (and verified) one at a time:
 
 * `3rdparty/AscendNPU-IR.patch` -- `no_side_effect` on `hivm.hir.custom`;
 * `3rdparty/AscendNPU-IR-hivm-memscope.patch` -- the distributed branches and
@@ -368,7 +369,7 @@ patch files, applied (and verified) one at a time:
   `'hivm.hir.copy' op Unsupported copy from cbuf to gm!`) plus
   `DistributedTransformUtils.h`, `InferCoreType.cpp`,
   `LibraryFunctionOpInterfaceImpl.cpp`, `InferHIVMDataLayout.{h,cpp}` and
-  `SplitMixKernel.cpp`.
+  `SplitMixKernel.cpp`;
 * `3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch` -- handle zero-operand
   custom ops in `MarkStrideAlign.cpp` before checking
   `hasPureBufferSemantics()`. `libshmem_device.barrier_all()` lowers to a
@@ -376,6 +377,9 @@ patch files, applied (and verified) one at a time:
   `hasPureBufferSemantics()` also requires at least one memref operand, so the
   pass otherwise fails with `error: Not bufferized.` after the `cbuf to gm`
   fix lets compilation get further.
+* `3rdparty/AscendNPU-IR-extra-buffer.patch` -- skips generic extra-buffer
+  allocation for distributed custom ops, which are opaque external SHMEM calls
+  and do not carry extra-buffer metadata.
 
 They are deliberately *not* one combined patch. `git apply` is atomic per
 invocation, so a tree that already carries only one of them -- which is exactly what

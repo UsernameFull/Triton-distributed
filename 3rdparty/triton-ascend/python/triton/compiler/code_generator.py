@@ -18,7 +18,7 @@ from triton.extension.buffer.language import core as bl
 from triton.extension.buffer.language.builder import setup_unified_builder_with_buffer_builder
 
 from .. import knobs, language
-from .._C.libtriton import ir, gluon_ir, buffer_ir
+from .._C.libtriton import ir, gluon_ir, buffer_ir, distributed
 from .._C.libtriton.ascend import ir as ascend_ir
 from ..language import constexpr, str_to_ty, tensor, tuple as tl_tuple
 from ..language.core import _unwrap_if_constexpr, base_value, base_type
@@ -324,6 +324,7 @@ class CodeGenerator(ast.NodeVisitor):
                 self.builder = ir.builder(context, compile_mode="simt")
             else:
                 self.builder = ir.builder(context, compile_mode="simd")
+            self.builder = distributed.ir.DistributedOpBuilder(context)
             self.semantic = TritonSemantic(self.builder)
 
         self.name_loc_as_prefix = None

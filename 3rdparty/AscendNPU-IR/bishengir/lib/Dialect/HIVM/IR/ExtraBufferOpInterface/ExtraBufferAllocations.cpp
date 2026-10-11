@@ -603,6 +603,9 @@ LogicalResult VXorOp::allocExtraBuffersIfPossible() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult CustomOp::allocExtraBuffersIfPossible() {
+  if (getOperation()->hasAttr("hivm.is_distributed")) {
+    return success();
+  }
   if (!llvm::to_vector(this->getTempBuffers()).empty()) {
     this->emitWarning("already has extra temp buffers");
     return success();

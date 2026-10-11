@@ -136,7 +136,7 @@ void MarkStrideAlignPass::runOnOperation() {
     }
 
     auto hivmOp = cast<HIVMStructuredOp>(op);
-    if (!hivmOp.hasPureBufferSemantics()) {
+    if (hivmOp->getNumOperands() > 0 && !hivmOp.hasPureBufferSemantics()) {
       hivmOp->emitError("Not bufferized.");
       return WalkResult::interrupt();
     }

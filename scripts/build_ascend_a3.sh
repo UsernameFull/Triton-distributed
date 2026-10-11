@@ -577,6 +577,7 @@ NPUIR_PATCHES=(
     "3rdparty/AscendNPU-IR-hivm-memscope.patch"
     "3rdparty/AscendNPU-IR-distributed.patch"
     "3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch"
+    "3rdparty/AscendNPU-IR-extra-buffer.patch"
 )
 for npuir_tree in "$INNER_NPU_DIR" "$REPO_DIR/3rdparty/AscendNPU-IR"; do
     for npuir_p in "${NPUIR_PATCHES[@]}"; do
@@ -588,7 +589,7 @@ done
 # (3rdparty/triton-ascend/third_party/ascend/AscendNPU-IR), which is what the
 # root CMake build compiles. Step 3 builds hivmc / bishengir-compile from the
 # OUTER 3rdparty/AscendNPU-IR, so that tree has to carry the same changes.
-# The distributed flow needs four independent things, carried by four patches:
+# The distributed flow needs five independent things, carried by five patches:
 #   * 3rdparty/AscendNPU-IR.patch -- the `no_side_effect` unit attr on
 #     `hivm.hir.custom` (HIVMOps.td), set by
 #     lib/Conversion/TritonDistributedToHIVM/ASCEND/DistributedOpToHIVM.cpp;
@@ -605,7 +606,7 @@ done
 #     memory becomes hivm.store/hivm.load instead of an unsupported
 #     `hivm.hir.copy ... cbuf to gm`), plus the distributed core-type / library
 #     call-name / data-layout handling (InferCoreType, LibraryFunctionOpInterface,
-#     InferHIVMDataLayout, SplitMixKernel, DistributedTransformUtils.h).
+#     InferHIVMDataLayout, SplitMixKernel, DistributedTransformUtils.h);
 #   * 3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch -- `hivm-mark-stride-align`
 #     must handle CustomOp *before* its "Not bufferized." assertion. Every
 #     aclshmem helper becomes an `hivm.hir.custom`, and the ones without
@@ -615,6 +616,9 @@ done
 #     therefore aborted the pipeline with
 #       loc("kernel.mlir":N:7): error: Not bufferized.
 #     (and, being a CUBE_AND_VECTOR op, it did so once per mix half).
+#   * 3rdparty/AscendNPU-IR-extra-buffer.patch -- distributed custom ops are
+#     opaque external calls, so the generic extra-buffer allocation pass must
+#     not fail only because the custom op carries no extra-buffer metadata.
 # Apply them one at a time -- again from the repo root with --directory:
 # `git apply` is atomic per invocation, so a tree that already carries only one
 # half of a combined patch would make that combined patch apply *nothing*.
@@ -644,8 +648,112 @@ apply_outer_npuir_patch() {
         "$distutils" 'isDistributedTypeCustomOp'
     apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR-hivm-mark-stride-align.patch" \
         "$stralign" 'Custom ops are handled before the'
+    local extrabuf="$rel/bishengir/lib/Dialect/HIVM/IR/ExtraBufferOpInterface/ExtraBufferAllocations.cpp"
+    apply_npuir_patch "$rel" "3rdparty/AscendNPU-IR-extra-buffer.patch" \
+        "$extrabuf" 'hasAttr("hivm.is_distributed")'
 }
 apply_outer_npuir_patch
+
+# ---------------------------------------------------------------------------
+# step 1.5: build the SHMEM device-side bitcode needed by distributed kernels
+# ---------------------------------------------------------------------------
+STEP=1.5-shmem-bitcode
+banner "step 1.5: build shmem device bitcode"
+
+build_shmem_device_bitcode() {
+    local output="$REPO_DIR/3rdparty/triton-ascend/third_party/ascend/backend/lib/libshmem_device.bc"
+    local stamp="$WORK_ROOT/.stamp_shmem_device_bc"
+    local fingerprint="dav-c220:cann:${ASCEND_HOME_PATH:-unknown}:wrapper-v1"
+    local build_dir="$WORK_ROOT/shmem-device-bitcode"
+    local ccinc vec_cmd cube_cmd mode cmd
+
+    if [[ "$FORCE" != "1" && -f "$stamp" && "$(cat "$stamp")" == "$fingerprint" && -s "$output" ]]; then
+        echo "[OK] shmem device bitcode already built: $output"
+        return 0
+    fi
+
+    command -v ccec >/dev/null 2>&1 || die "ccec not found after sourcing CANN env"
+    [[ -n "${ASCEND_HOME_PATH:-}" ]] || die "ASCEND_HOME_PATH is unset"
+    local llvm_link="$ASCEND_HOME_PATH/tools/bisheng_compiler/bin/llvm-link"
+    [[ -x "$llvm_link" ]] || die "CANN llvm-link not found: $llvm_link"
+
+    rm -rf "$build_dir"
+    mkdir -p "$build_dir" "$REPO_DIR/3rdparty/triton-ascend/third_party/ascend/backend/lib"
+    cat > "$build_dir/shmem_device_bc_template.cpp" <<'EOF'
+#include "gm2gm/engine/shmem_device_mte.h"
+#include "gm2gm/shmem_device_so.hpp"
+#include "gm2gm/shmem_device_cc.h"
+
+struct AclShmemMemRef1D {
+    __gm__ void *allocated;
+    __gm__ void *aligned;
+    int64_t offset;
+    int64_t size;
+    int64_t stride;
+};
+
+extern "C" {
+ACLSHMEM_DEVICE __attribute__((used)) __attribute__((visibility("default"))) __gm__ void *aclshmem_ptr_half(__gm__ void *ptr, int pe) {
+    return aclshmem_ptr(ptr, pe);
+}
+
+ACLSHMEM_DEVICE __attribute__((used)) __attribute__((visibility("default"))) void _mlir_ciface_aclshmem_ptr_half(AclShmemMemRef1D *result, AclShmemMemRef1D *input, int pe) {
+    __gm__ void *peer = aclshmem_ptr_half(input->aligned, pe);
+    result->allocated = peer;
+    result->aligned = peer;
+    result->offset = input->offset;
+    result->size = input->size;
+    result->stride = input->stride;
+}
+
+ACLSHMEM_DEVICE __attribute__((used)) __attribute__((visibility("default"))) void _mlir_ciface_aclshmem_barrier_all() {
+    aclshmem_barrier_all();
+}
+}
+EOF
+
+    ccinc="-I$ASCEND_HOME_PATH/compiler/tikcpp \
+-I$ASCEND_HOME_PATH/compiler/tikcpp/tikcfw \
+-I$ASCEND_HOME_PATH/compiler/tikcpp/tikcfw/impl \
+-I$ASCEND_HOME_PATH/compiler/tikcpp/tikcfw/interface \
+-I$ASCEND_HOME_PATH/include \
+-I$REPO_DIR/3rdparty/shmem/include \
+-I$REPO_DIR/3rdparty/shmem/include/device \
+-I$REPO_DIR/3rdparty/shmem/src/device"
+
+    for mode in vector cube; do
+        if [[ "$mode" == "vector" ]]; then
+            sed 's/__AICORE_SUFFIX__/.vector/g' "$build_dir/shmem_device_bc_template.cpp" > "$build_dir/shmem_device_vector.cpp"
+            suffix=vec
+        else
+            sed 's/__AICORE_SUFFIX__/.cube/g' "$build_dir/shmem_device_bc_template.cpp" > "$build_dir/shmem_device_cube.cpp"
+            suffix=cube
+        fi
+        cmd=$(ccec -xcce -std=c++17 -O0 -DNDEBUG --cce-aicore-arch=dav-c220 $ccinc \
+            -c "$build_dir/shmem_device_${mode}.cpp" -v 2>&1 \
+            | grep "^ \".*bisheng_compiler/bin/bisheng\" -cc1" \
+            | grep "dav-c220-$suffix" \
+            | sed -e 's/^ "//' -e 's/" -cc1/ -cc1/' \
+                  -e 's/ -emit-obj / -emit-llvm-bc /' \
+                  -e "s#-o [^ ]*#-o $build_dir/shmem_device_$suffix.bc#")
+        [[ -n "$cmd" ]] || die "could not derive ccec LLVM-bc command for $mode"
+        eval "$cmd" > "$build_dir/${suffix}_build.log" 2>&1 \
+            || { tail -80 "$build_dir/${suffix}_build.log" >&2; die "failed to compile shmem device bitcode for $mode"; }
+        [[ -s "$build_dir/shmem_device_$suffix.bc" ]] || die "missing shmem device bitcode for $mode"
+    done
+
+    "$llvm_link" -only-needed -o "$output" \
+        "$build_dir/shmem_device_vec.bc" "$build_dir/shmem_device_cube.bc" \
+        || die "failed to link shmem device bitcode"
+    [[ -s "$output" ]] || die "linked shmem device bitcode is empty"
+    local runtime_lib="$REPO_DIR/3rdparty/triton-ascend/python/triton/backends/ascend/lib"
+    mkdir -p "$runtime_lib"
+    ln -sfn ../../../../../third_party/ascend/backend/lib/libshmem_device.bc \
+        "$runtime_lib/libshmem_device.bc"
+    printf '%s\n' "$fingerprint" > "$stamp"
+    echo "[OK] built shmem device bitcode: $output"
+}
+build_shmem_device_bitcode
 
 # ---------------------------------------------------------------------------
 # step 2: build LLVM (vendored, patch pre-applied, out-of-source)
@@ -716,11 +824,13 @@ NPUIR_TD="$NPU_IR_DIR/bishengir/include/bishengir/Dialect/HIVM/IR/HIVMOps.td"
 NPUIR_MEMSCOPE="$NPU_IR_DIR/bishengir/lib/Dialect/HIVM/Transforms/InferHIVMMemScope.cpp"
 NPUIR_DISTUTILS="$NPU_IR_DIR/bishengir/include/bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
 NPUIR_STRALIGN="$NPU_IR_DIR/bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp"
+NPUIR_EXTRABUF="$NPU_IR_DIR/bishengir/lib/Dialect/HIVM/IR/ExtraBufferOpInterface/ExtraBufferAllocations.cpp"
 NPUIR_PATCHED=0
 if grep -qF 'UnitAttr:$no_side_effect' "$NPUIR_TD" 2>/dev/null \
    && grep -qF 'inferAndPropagateMemScopeForDistributed' "$NPUIR_MEMSCOPE" 2>/dev/null \
    && grep -qF 'isDistributedTypeCustomOp' "$NPUIR_DISTUTILS" 2>/dev/null \
-   && grep -qF 'Custom ops are handled before the' "$NPUIR_STRALIGN" 2>/dev/null; then
+   && grep -qF 'Custom ops are handled before the' "$NPUIR_STRALIGN" 2>/dev/null \
+   && grep -qF 'hasAttr("hivm.is_distributed")' "$NPUIR_EXTRABUF" 2>/dev/null; then
     NPUIR_PATCHED=1
 fi
 if [[ "$FORCE" != "1" && -f "$WORK_ROOT/.stamp_npu_ir" \

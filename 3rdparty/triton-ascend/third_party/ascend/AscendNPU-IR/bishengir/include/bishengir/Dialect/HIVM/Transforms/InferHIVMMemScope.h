@@ -50,6 +50,10 @@ LogicalResult inferAndPropagateMemScopeForMmadL1(MmadL1Op op);
 /// \note FuncOp should be bufferized beforehand.
 LogicalResult inferAndPropagateMemScopeForFunc(func::FuncOp op);
 
+/// Infer, propagate, and set memory scope information to DistributedOp.
+/// \note DistributedOp should be bufferized beforehand.
+LogicalResult inferAndPropagateMemScopeForDistributed(hivm::CustomOp op);
+
 /// Infer, propagate, and set memory scope information to PointerCastOp.
 LogicalResult inferAndPropagateMemScopeForPointerCast(hivm::PointerCastOp op);
 

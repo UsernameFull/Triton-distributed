@@ -19,6 +19,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
+#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
@@ -327,6 +328,29 @@ static bool isLoopOfCoreType(scf::ForOp forOp, TCoreType coreType) {
          coreType == inferredCoreType.value();
 }
 
+static void inferDistributedCoreType(func::FuncOp mixedFunc) {
+  auto rectifyCoreType = [mixedFunc](hivm::TCoreType &cur) {
+    auto funcCoreType = mixedFunc
+                            ->getAttrOfType<hivm::TFuncCoreTypeAttr>(
+                                hivm::TFuncCoreTypeAttr::name)
+                            .getFuncCoreType();
+    if (cur == TCoreType::CUBE_AND_VECTOR) {
+      return kTFuncCoreType2TCoreType.at(funcCoreType);
+    }
+    return cur;
+  };
+  mixedFunc->walk([&rectifyCoreType](Operation *op) {
+    if (isDistributedTypeCustomOp(op)) {
+      if (auto res = hivm::detail::queryCoreTypeHelper(op)) {
+        auto coreType = rectifyCoreType(res.value());
+        auto coreTypeAttr =
+            hivm::TCoreTypeAttr::get(op->getContext(), coreType);
+        op->setAttr(hivm::TCoreTypeAttr::name, coreTypeAttr);
+      }
+    }
+  });
+}
+
 // erase ops of given core type from function
 void SplitMixKernelPass::filterMixFunc(OpBuilder &builder,
                                        func::FuncOp mixedFunc,
@@ -335,6 +359,12 @@ void SplitMixKernelPass::filterMixFunc(OpBuilder &builder,
       filterCoreType == TCoreType::CUBE ? TCoreType::VECTOR : TCoreType::CUBE;
 
   SmallVector<Operation *> toSinkOutOfLoop;
+  // TODO: Refactor filter logic: First infer all op's core type, then filter
+  // and erase ops according to core type does not match.
+
+  // because of filter will erase op during walk, distributed op needs infer
+  // core type before filter
+  inferDistributedCoreType(mixedFunc);
   mixedFunc.walk<WalkOrder::PostOrder>([&](Operation *op) {
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
       if (isLoopOfCoreType(forOp, filterCoreType)) {

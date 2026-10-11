@@ -31,7 +31,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, Union
 
-from triton._C.libtriton import ir, passes, ascend
+from triton._C.libtriton import ir, passes, ascend, distributed
 from triton.backends.ascend.utils import (
     _check_bishengir_api_change,
     _check_bishengir_able_save_ir,
@@ -116,6 +116,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             auto_blockify_size = 1
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
+        distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm)
         ascend.passes.ttir.add_auto_blockify(
             pm,
             auto_blockify_size
@@ -735,6 +736,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
                     [f"--link-aicore-bitcode={bitcode}"]
 
         _compile_option_list += [
+            f"--link-aicore-bitcode={get_shmem_device_bitcode()}",
             f"--link-aicore-bitcode={get_libdevice()}"
         ]
 
@@ -803,6 +805,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
 def get_libdevice():
     current = os.path.dirname(__file__)
     return os.path.join(current, "lib/libdevice.10.bc")
+
+
+def get_shmem_device_bitcode():
+    current = os.path.dirname(__file__)
+    return os.path.join(current, "lib/libshmem_device.bc")
 
 
 @dataclass(frozen=True)

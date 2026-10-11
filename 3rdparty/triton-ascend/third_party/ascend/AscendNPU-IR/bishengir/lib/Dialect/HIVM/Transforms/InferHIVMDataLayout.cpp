@@ -15,9 +15,11 @@
 //
 //===----------------------------------------------------------------------===//
 #include "bishengir/Dialect/HIVM/Transforms/InferHIVMDataLayout.h"
+#include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
+#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
 #include "bishengir/Dialect/HIVM/Transforms/Passes.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/MemRefExt/IR/MemRefExt.h"
@@ -40,8 +42,10 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -593,6 +597,9 @@ DataLayoutInferAndPropagateHelper::propagateDataLayoutToUsers(
             [&](bishengir::memref_ext::AllocWorkspaceOp op) {
               updateLayout(op->getResults(), info, changed);
             })
+        // TODO: adapt custom op's infer data layout in V2
+        .Case<hivm::CustomOp>(
+            [&](hivm::CustomOp op) { populateLayoutToHIVMCustom(op, changed); })
         .Default([&](Operation *op) {
           // Don't need to update Ops that don't have results.
           if (op->getNumResults() == 0)
@@ -635,6 +642,56 @@ void DataLayoutInferAndPropagateHelper::updateLayout(
       continue;
     if (updateLayoutIfChanged(value, info))
       changed.push_back(value);
+  }
+}
+
+/// Populates the layout information for a value if it is absent.
+/// @param value The value to populate layout for.
+/// @param info The layout information to insert.
+/// @return True if the layout was populated, false if the value already had
+/// layout information and was not modified.
+bool DataLayoutInferAndPropagateHelper::populateLayoutIfAbsent(
+    Value value, const LayoutInfo &info) {
+
+  if (layout_info_.contains(value)) {
+    LDBG("Not populating, layout_info_ for " << value << " already exists");
+    return false;
+  }
+
+  layout_info_[value] = info;
+  LLVM_DEBUG(llvm::dbgs() << "  [Init] Value [" << value
+                          << "] Current layout is: " << info.currentLayout
+                          << ", Target layout is: " << info.targetLayout
+                          << "\n";);
+  return true;
+}
+
+void DataLayoutInferAndPropagateHelper::populateLayout(
+    ValueRange values, const LayoutInfo &info, SmallVector<Value> &changed) {
+
+  for (Value value : values) {
+    if (!isa<BaseMemRefType>(value.getType()))
+      continue;
+    if (populateLayoutIfAbsent(value, info))
+      changed.push_back(value);
+  }
+}
+
+void DataLayoutInferAndPropagateHelper::populateLayoutToHIVMCustom(
+    hivm::CustomOp op, SmallVector<Value> &changed) {
+  if (!llvm::any_of(op->getResultTypes(), [](Type v) {
+        return ::llvm::isa<::mlir::BaseMemRefType>(v);
+      })) {
+    return;
+  }
+  auto results = op->getResults();
+  auto symbol = op.getSymbol();
+  llvm::StringRef symbolRef = symbol;
+  if (symbolRef.starts_with(kShmemConsumeToken) ||
+      symbolRef.starts_with(kShmemPtr)) {
+    updateLayout(results, layout_info_[op->getOperand(0)], changed);
+  } else {
+    op->emitWarning("unsupport hivm.custom symbol for infer results layout");
   }
 }
 

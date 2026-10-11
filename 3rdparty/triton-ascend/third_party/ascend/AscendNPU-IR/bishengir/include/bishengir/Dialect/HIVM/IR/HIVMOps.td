@@ -504,7 +504,7 @@ def CustomOp
   }];
 
   let arguments = (ins StrAttr:$name, Variadic<AnyType>:$inputs,
-      Variadic<AnyType>:$outputs, Variadic<AnyType>:$temp_buffers);
+      Variadic<AnyType>:$outputs, Variadic<AnyType>:$temp_buffers, UnitAttr:$no_side_effect);
 
   let results = (outs Variadic<AnyType>:$results);
 

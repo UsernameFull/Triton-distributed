@@ -6,10 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "bishengir/Dialect/HIVM/IR/HIVMDialectExtension.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
-#include "bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.h"
+#include "bishengir/Dialect/HIVM/IR/HIVMDialectExtension.h"
 #include "bishengir/Dialect/HIVM/IR/HIVMImpl.h"
+#include "bishengir/Dialect/HIVM/IR/HIVMInterfaces.h"
+#include "bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.h"
+#include "bishengir/Dialect/HIVM/Transforms/DistributedTransformUtils.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/Utils/Util.h"
 
@@ -18,8 +20,10 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <algorithm>
+#include <string>
 
 #include "bishengir/Dialect/HIVM/Interfaces/LibraryFunctionOpInterface.cpp.inc"
 
@@ -240,7 +244,7 @@ std::string getNZ2NDOpLibraryCallName(NZ2NDOp concreteOp,
          "_" + dataTypeStr;
 }
 
-std::string debugCallNameMangleSuffix(Operation *op) {
+std::string callNameMangleSuffix(Operation *op) {
   std::string suffix = "";
   ModuleOp moduleOp = op->getParentOfType<ModuleOp>();
   if (!moduleOp) {
@@ -337,7 +341,7 @@ std::string getDebugOpLibraryCallName(DebugOp concreteOp,
     callName += "_gm"; // currently, scalar can choose either gm or ubuf since
                        // they currently call the same core
   }
-  return callName + debugCallNameMangleSuffix(concreteOp.getOperation());
+  return callName + callNameMangleSuffix(concreteOp.getOperation());
 }
 
 void updateStringStreamForMixMatmulOp(std::stringstream &ss,
@@ -799,7 +803,7 @@ std::string InferMaxRankExternalModel<VDeinterleaveOp>::getOpLibraryCallName(
 template <>
 std::string NoMaxRankExternalModel<FinishDebugOp>::getOpLibraryCallName(
     Operation *op, std::optional<bool> isOpsAligned) const {
-  return "_mlir_ciface_finish_debug" + debugCallNameMangleSuffix(op);
+  return "_mlir_ciface_finish_debug" + callNameMangleSuffix(op);
 }
 
 //===----------------------------------------------------------------------===//
@@ -835,7 +839,7 @@ std::string NoMaxRankExternalModel<FixpipeOp>::getOpLibraryCallName(
 template <>
 std::string NoMaxRankExternalModel<InitDebugOp>::getOpLibraryCallName(
     Operation *op, std::optional<bool> isOpsAligned) const {
-  return "_mlir_ciface_init_debug" + debugCallNameMangleSuffix(op);
+  return "_mlir_ciface_init_debug" + callNameMangleSuffix(op);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1086,7 +1090,22 @@ std::string InferMaxRankExternalModel<CustomOp>::getOpLibraryCallName(
     return inferBuiltinCallName(isOpsAligned);
   }
 
-  return concreteOp.getSymbol();
+  // add _mlir_ciface_ prefix if no memref in op's operands and values
+  auto hasMemrefInArgOrRet = [&concreteOp]() {
+    auto isMemref = [](Value v) {
+      return ::llvm::isa<::mlir::BaseMemRefType>(v.getType());
+    };
+    if (::llvm::any_of(concreteOp->getOperands(), isMemref))
+      return true;
+    if (::llvm::any_of(concreteOp.getResults(), isMemref))
+      return true;
+    return false;
+  };
+  std::string prefix = concreteOp.getSymbol();
+  if (!hasMemrefInArgOrRet()) {
+    prefix = "_mlir_ciface_" + prefix;
+  }
+  return prefix + callNameMangleSuffix(op);
 }
 
 #define REGISTER_STATIC_MAX_RANK(OP, MAX_RANK)                                 \

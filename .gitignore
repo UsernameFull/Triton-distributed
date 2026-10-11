@@ -86,3 +86,10 @@ tmp*
 
 .cursor
 *.csv
+
+# Generated SHMEM device bitcode (built by scripts/build_ascend_a3.sh)
+/3rdparty/triton-ascend/third_party/ascend/backend/lib/libshmem_device.bc
+/shmem_device_*.o
+
+# Editable-build artifacts
+/3rdparty/triton-ascend/python/triton/_C/

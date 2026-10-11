@@ -212,6 +212,8 @@ class BackendInstaller:
                     TA_dir / "../AscendNPU-IR-distributed.patch")
                 npuir_mark_stride_align_patch = (
                     TA_dir / "../AscendNPU-IR-hivm-mark-stride-align.patch")
+                npuir_extra_buffer_patch = (
+                    TA_dir / "../AscendNPU-IR-extra-buffer.patch")
                 # `required` pins down the parts of each patch the Ascend build
                 # cannot work without, so a silently-skipped `git apply` fails
                 # here instead of at runtime (see apply_vendored_patch).
@@ -223,7 +225,7 @@ class BackendInstaller:
                     ("third_party/ascend/backend/compiler.py",
                      "add_convert_triton_distributed_to_hivm"),
                 ))
-                # FOUR SEPARATE AscendNPU-IR patches, applied and checked one at
+                # FIVE SEPARATE AscendNPU-IR patches, applied and checked one at
                 # a time. A tree that already carries only one of them (e.g.
                 # from an older revision of the same patch) would make a
                 # combined patch fail to apply *entirely* -- `git apply` is
@@ -275,6 +277,12 @@ class BackendInstaller:
                         # memref operand.
                         ("bishengir/lib/Dialect/HIVM/Transforms/AlignBuffer/MarkStrideAlign.cpp",
                          "Custom ops are handled before the"),
+                    ))
+                apply_vendored_patch(
+                    npuir_path, npuir_extra_buffer_patch,
+                    "AscendNPU-IR (distributed extra buffers)", required=(
+                        ("bishengir/lib/Dialect/HIVM/IR/ExtraBufferOpInterface/ExtraBufferAllocations.cpp",
+                         'hasAttr("hivm.is_distributed")'),
                     ))
 
             backend_src_dir = os.path.join(root_dir, backend_name)
