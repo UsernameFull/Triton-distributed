@@ -14,7 +14,18 @@ bash scripts/install_ascend_910b.sh
 ```
 
 可配置 `WORK_DIR=/data/triton-910b-build` 保存产物，默认是仓库下 `.ascend-910b/`。
-`CANN_ENV` 指定 CANN 的 set_env.sh；`PYTHON` 指定基础 Python（默认 python3）。
+CANN 位置从环境变量读取：优先使用显式指定的 `CANN_ENV`（set_env.sh 文件），
+否则按 `ASCEND_HOME_PATH`、`ASCEND_TOOLKIT_HOME`、`ASCEND_TOOLKIT_LATEST_HOME`
+的优先级选择安装目录，在该目录及其父目录寻找 `set_env.sh`，不使用固定安装路径。
+缺少变量或脚本时给出错误提示。`PYTHON` 指定基础 Python（默认 python3）。
+
+```bash
+ASCEND_HOME_PATH=/data/Ascend/ascend-toolkit/latest \
+bash scripts/install_ascend_a3.sh
+# 或直接指定环境脚本
+CANN_ENV=/data/Ascend/ascend-toolkit/set_env.sh \
+bash scripts/install_ascend_910b.sh
+```
 虚拟环境使用 `--system-site-packages` 复用 torch/torch_npu，不是完全隔离环境。
 
 只有 CANN、尚无 PyTorch 时，传入与 CANN/Python/主机架构匹配的 wheel：

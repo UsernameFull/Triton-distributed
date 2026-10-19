@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 WORK_DIR=${WORK_DIR:-"${ROOT}/.ascend-910b"}
-CANN_ENV=${CANN_ENV:-/usr/local/Ascend/ascend-toolkit/set_env.sh}
+CANN_ENV=${CANN_ENV:-}
 PYTHON=${PYTHON:-python3}
 JOBS=${JOBS:-4}
 TEST_TIMEOUT=${TEST_TIMEOUT:-1800}
@@ -14,7 +14,9 @@ usage() {
 Usage: bash scripts/install_ascend_910b.sh [--help|--prereqs-only|--tests-only]
 Run on a 910B host with CANN and >=4 visible NPUs for the full suite (2 for prereqs).
 Environment variables:
-  CANN_ENV       CANN set_env.sh path
+  CANN_ENV       Optional explicit set_env.sh path
+  ASCEND_HOME_PATH / ASCEND_TOOLKIT_HOME / ASCEND_TOOLKIT_LATEST_HOME
+                 CANN installation root used to locate set_env.sh (in this order)
   WORK_DIR       Build, venv and log directory (default: .ascend-910b)
   PYTHON         Base Python with compatible torch/torch_npu (default: python3)
   TORCH_VERSION / TORCH_NPU_VERSION Exact package versions if installing from index
@@ -51,7 +53,20 @@ STAGE=preflight
 trap 'rc=$?; printf "\nFAILED stage=%s line=%s status=%s\nLog: %s\n" "$STAGE" "$LINENO" "$rc" "$LOG" >&2; exit "$rc"' ERR
 fail() { printf 'ERROR: %s\nStage: %s\nLog: %s\n' "$*" "$STAGE" "$LOG" >&2; exit 1; }
 stage() { STAGE=$1; printf '\n[%s] %s\n' "$(date -u +%FT%TZ)" "$STAGE"; }
+if [[ -z $CANN_ENV ]]; then
+    cann_root=${ASCEND_HOME_PATH:-${ASCEND_TOOLKIT_HOME:-${ASCEND_TOOLKIT_LATEST_HOME:-}}}
+    [[ -n $cann_root ]] || fail 'Set ASCEND_HOME_PATH (or ASCEND_TOOLKIT_HOME/ASCEND_TOOLKIT_LATEST_HOME), or explicitly set CANN_ENV'
+    [[ -d $cann_root ]] || fail "CANN installation directory does not exist: $cann_root"
+    cann_root=$(cd "$cann_root" && pwd)
+    # Some toolkit layouts put set_env.sh alongside the version directory.
+    for candidate in "$cann_root/set_env.sh" "$cann_root/../set_env.sh"; do
+        if [[ -f $candidate ]]; then CANN_ENV=$candidate; break; fi
+    done
+    [[ -n $CANN_ENV ]] || fail "No set_env.sh found under $cann_root or its parent; set CANN_ENV explicitly"
+fi
 [[ -f $CANN_ENV ]] || fail "CANN_ENV does not exist: $CANN_ENV"
+CANN_ENV="$(cd "$(dirname "$CANN_ENV")" && pwd)/$(basename "$CANN_ENV")"
+printf 'CANN environment: %s\n' "$CANN_ENV"
 # Vendor environment scripts are not necessarily nounset-safe.
 set +u
 source "$CANN_ENV"

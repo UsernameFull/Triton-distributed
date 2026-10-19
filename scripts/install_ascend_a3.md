@@ -4,7 +4,9 @@ A3 入口复用 [A2/910B 安装流程](install_ascend_910b.md)，默认使用独
 仓库 triton-ascend 提供 A2/A3 共用编译路径，SHMEM 文档也列出 A3 支持。
 本脚本尚未在 A3 实机完成编译和通信验证；此前 910B 的测试结果不代表 A3 已通过。
 
-先安装适配 A3 的驱动、CANN，以及匹配的 Python/torch/torch_npu，然后运行：
+先安装适配 A3 的驱动、CANN，以及匹配的 Python/torch/torch_npu。
+CANN 位置从 ASCEND_HOME_PATH、ASCEND_TOOLKIT_HOME 或 ASCEND_TOOLKIT_LATEST_HOME
+读取（按上述顺序），也可用 CANN_ENV 显式指定 set_env.sh，不使用固定安装路径。然后运行：
 
 ```bash
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
