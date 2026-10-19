@@ -26,6 +26,7 @@ Environment variables:
   LLVM_INSTALL_PREFIX Optional existing LLVM installation matching docs/build.md
   JOBS           Parallel build jobs (default: 4)
   TEST_TIMEOUT   Timeout in seconds per test phase (default: 1800)
+  LLVM_SOURCE_ARCHIVE Optional tar.gz from the exact LLVM_COMMIT (GitHub codeload)
   LLVM_PATCH_URL Optional mirror for the documented LLVM patch
 System prerequisites (Debian/Ubuntu example, install as administrator):
   apt-get install git curl build-essential clang-15 lld-15 ccache python3-venv python3-dev
@@ -69,10 +70,22 @@ done
 if (( missing )); then
     [[ $(id -u) == 0 ]] || fail 'Missing build prerequisites; rerun as root or ask an administrator to install packages listed in --help'
     if command -v apt-get >/dev/null; then
-        apt-get update
-        apt-get install -y git curl build-essential clang-15 lld-15 ccache python3-venv python3-dev
+        packages=()
+        for package in git curl build-essential clang-15 lld-15 ccache python3-venv python3-dev; do
+            if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+                packages+=("$package")
+            fi
+        done
+        if (( ${#packages[@]} )); then
+            apt-get update
+            apt-get install -y --no-upgrade "${packages[@]}"
+        fi
     elif command -v dnf >/dev/null; then
-        dnf install -y git curl gcc gcc-c++ make clang lld ccache python3-devel
+        packages=()
+        for package in git curl gcc gcc-c++ make clang lld ccache python3-devel; do
+            if ! rpm -q "$package" >/dev/null 2>&1; then packages+=("$package"); fi
+        done
+        if (( ${#packages[@]} )); then dnf install -y "${packages[@]}"; fi
     else
         fail 'Unsupported package manager; install build prerequisites manually'
     fi
@@ -104,6 +117,8 @@ elif [[ -n ${TORCH_VERSION:-} || -n ${TORCH_NPU_VERSION:-} ]]; then
 elif ! python -c 'import importlib.util; assert importlib.util.find_spec("torch") and importlib.util.find_spec("torch_npu")'; then
     fail 'torch/torch_npu missing. Supply TORCH_VERSION and TORCH_NPU_VERSION matched to CANN, or both wheel paths; no compatible version is guessed'
 fi
+# Platform wrappers may request a hardware family check without overriding detection.
+export TRITON_DIST_EXPECTED_PLATFORM=${TRITON_DIST_EXPECTED_PLATFORM:-}
 required_npus=4
 if (( PREREQS_ONLY )); then required_npus=2; fi
 REQUIRED_NPUS="$required_npus" timeout --kill-after=30s "$TEST_TIMEOUT" python -u - <<'PY'
@@ -118,6 +133,9 @@ required = int(os.environ['REQUIRED_NPUS'])
 assert torch.npu.device_count() >= required, f'This mode requires at least {required} visible NPUs'
 for device in range(2):
     torch.npu.set_device(device)
+    name = torch.npu.get_device_name(device)
+    if os.environ.get('TRITON_DIST_EXPECTED_PLATFORM') == 'A3':
+        assert name.startswith(('Ascend910_93', 'Ascend910C')), f'A3 device expected, detected {name}'
     x = torch.ones((16, 16), device=f'npu:{device}')
     torch.testing.assert_close((x @ x).cpu(), torch.full((16, 16), 16.))
     print('NPU', device, torch.npu.get_device_name(device), 'matmul PASS')
@@ -180,13 +198,28 @@ stage llvm
 if [[ -z ${LLVM_INSTALL_PREFIX:-} ]]; then
     LLVM_INSTALL_PREFIX="$WORK_DIR/llvm-install"
     LLVM_SRC="$WORK_DIR/llvm-project"
-    if [[ ! -d $LLVM_SRC/.git ]]; then git init "$LLVM_SRC"; git -C "$LLVM_SRC" remote add origin https://github.com/llvm/llvm-project.git; fi
+    if [[ -n ${LLVM_SOURCE_ARCHIVE:-} ]]; then
+        if [[ ! -f $LLVM_SRC/.archive-revision ]]; then
+            [[ ! -e $LLVM_SRC ]] || fail 'Use a fresh WORK_DIR for LLVM_SOURCE_ARCHIVE'
+            tar -tzf "$LLVM_SOURCE_ARCHIVE" | cut -d/ -f1 | sort -u > "$WORK_DIR/archive-roots.txt"
+            [[ $(cat "$WORK_DIR/archive-roots.txt") == "llvm-project-$LLVM_COMMIT" ]] || fail 'LLVM archive revision differs from pinned commit'
+            mkdir -p "$LLVM_SRC"
+            tar -xzf "$LLVM_SOURCE_ARCHIVE" --strip-components=1 -C "$LLVM_SRC"
+            printf '%s\n' "$LLVM_COMMIT" > "$LLVM_SRC/.archive-revision"
+        fi
+        [[ $(cat "$LLVM_SRC/.archive-revision") == "$LLVM_COMMIT" ]] || fail 'LLVM archive marker mismatch'
+    elif [[ ! -d $LLVM_SRC/.git ]]; then
+        git init "$LLVM_SRC"
+        git -C "$LLVM_SRC" remote add origin https://github.com/llvm/llvm-project.git
+    fi
     if [[ ! -f $LLVM_INSTALL_PREFIX/.triton-dist-llvm-ready ]]; then
         if git -C "$LLVM_SRC" rev-parse HEAD >/dev/null 2>&1; then
             check_clean "$LLVM_SRC" "$WORK_DIR/llvm.patch"
         fi
-        git -C "$LLVM_SRC" fetch --depth=1 origin "$LLVM_COMMIT"
-        git -C "$LLVM_SRC" checkout --detach FETCH_HEAD
+        if [[ -z ${LLVM_SOURCE_ARCHIVE:-} ]]; then
+            git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=60 -C "$LLVM_SRC" fetch --depth=1 origin "$LLVM_COMMIT"
+            git -C "$LLVM_SRC" checkout --detach FETCH_HEAD
+        fi
         if [[ ! -s $WORK_DIR/llvm.patch ]]; then
             curl -fL --retry 3 --connect-timeout 30 "$LLVM_PATCH_URL" -o "$WORK_DIR/llvm.patch.download"
             mv "$WORK_DIR/llvm.patch.download" "$WORK_DIR/llvm.patch"
@@ -265,6 +298,7 @@ ENV_FILE="$WORK_DIR/env.sh"
     printf 'export LLVM_INSTALL_PREFIX=%q\nexport LLVM_SYSPATH=%q\n' "$LLVM_INSTALL_PREFIX" "$LLVM_INSTALL_PREFIX"
     printf 'export PATH=%q:%q:"$PATH"\n' "$NPUIR_RUNTIME_BIN" "$LLVM_INSTALL_PREFIX/bin"
     printf 'export TRITON_USE_ASCEND=ON\n'
+    printf 'export TRITON_DIST_EXPECTED_PLATFORM=%q\n' "$TRITON_DIST_EXPECTED_PLATFORM"
 } > "$ENV_FILE"
 else
     [[ -f $WORK_DIR/env.sh ]] || fail 'No installed environment; run full installation first'
@@ -279,6 +313,9 @@ torch.npu.set_device(0)
 target = driver.active.get_current_target()
 print('Triton:', triton.__file__, 'target:', target)
 assert target.backend in ('npu', 'ascend'), f'Unexpected backend: {target}'
+import os
+if os.environ.get('TRITON_DIST_EXPECTED_PLATFORM') == 'A3':
+    assert str(target.arch).startswith('Ascend910_93'), f'A3 compiler target expected: {target.arch}'
 assert torch.npu.device_count() >= 4, 'The full suite includes a four-rank sub-team test; expose >=4 NPUs'
 assert hasattr(shmem, 'aclshmem_init'), 'Wrong SHMEM Python package'
 PY

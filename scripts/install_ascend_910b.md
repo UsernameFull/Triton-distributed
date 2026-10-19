@@ -115,3 +115,38 @@ NPUIR_RUNTIME_BIN=/tmp/triton-dist-910b-validation/npuir-build/bin \
 JOBS=48 TEST_TIMEOUT=1200 \
 bash scripts/install_ascend_910b.sh
 ```
+
+## 卸载后重新安装验证
+
+2026-10-18 再次验证时，先卸载系统 clang、lld、ccache，以及系统和旧验证虚拟环境中的
+shmem。保留 CANN、驱动、torch、torch_npu，使用全新的 `/tmp/triton-dist-910b-clean`
+构建目录，移走原 Python/C++ build 目录。LLVM 和独立运行时编译器均重新构建，
+未传入 LLVM_INSTALL_PREFIX 或 NPUIR_RUNTIME_BIN 复用旧工具链。
+
+此次发现 GitHub Git 传输停滞，增加 LLVM_SOURCE_ARCHIVE 支持官方同提交源码包：
+
+```bash
+curl -fL --retry 3 \
+  https://codeload.github.com/llvm/llvm-project/tar.gz/fad3272286528b8a491085183434c5ad4b59ab92 \
+  -o /tmp/llvm-source.tar.gz
+ASCEND_RT_VISIBLE_DEVICES=1,2,4,5 \
+WORK_DIR=/data/triton-910b-clean \
+LLVM_SOURCE_ARCHIVE=/tmp/llvm-source.tar.gz \
+JOBS=8 bash scripts/install_ascend_910b.sh
+```
+
+源码包必须是该提交的官方 tar.gz，脚本核对顶层目录名及解包标记；自行提供的压缩包需保证可信。
+本次下载文件的 SHA256：
+`a45117e2bafdfbb791b46aa817c2b22d0dc1ffe708a7b4fc0acf7bff8c2fdc48`。
+
+旧的系统工具安装分支还连带升级了 gcc、git、curl、系统 Python 3.11 及相关库；
+当前基础 Python 3.12 和 torch 未替换。脚本已改为只把缺失包传给包管理器，
+减少无关升级；安装新包所需的依赖仍由包管理器解析。
+
+本次卸载后重装完整入口退出码为 0：HCCL 通过，Ascend 测试集 11/11 通过
+（217.15 秒），AllGather GEMM 两个 rank 的数值校验通过。
+完整日志：`/tmp/triton-dist-910b-clean/logs/install-20261018T161724Z.log`。
+运行环境：`source /tmp/triton-dist-910b-clean/env.sh`。
+修改后的“只安装缺失系统包”分支另外通过实际卸载并自动重装 ccache 验证，
+此次仅安装 ccache，没有升级其他包。日志位于 `/tmp/triton-910b-clean-audit/system-recheck.log`。
+本次脚本与说明更新尚未提交或推送 GitHub。
