@@ -161,3 +161,13 @@ JOBS=8 bash scripts/install_ascend_910b.sh
 修改后的“只安装缺失系统包”分支另外通过实际卸载并自动重装 ccache 验证，
 此次仅安装 ccache，没有升级其他包。日志位于 `/tmp/triton-910b-clean-audit/system-recheck.log`。
 本次脚本与说明更新尚未提交或推送 GitHub。
+
+## clang 过旧时自动补齐
+
+脚本先检查 CC/CXX 指定的配对，再搜索 clang-15、默认 clang 以及 clang-16..22。
+只使用主版本一致且 >=15 的 C/C++ 编译器。旧的默认 clang 不会阻止选择已有新版。
+若找不到合适配对，root 下自动尝试安装：apt 安装 clang-15/lld-15（可与旧版共存），
+dnf 从已配置的软件源安装或升级 clang/lld。随后重新选择并校验版本。
+普通用户需由管理员安装，或提供新版 CC/CXX 路径；不会自动执行 sudo。
+如果软件源最高版本仍低于 15，脚本保留构建目录并提示启用较新工具链软件源或指定路径，
+不会直接下载未经验证的第三方编译器。A3 入口复用相同逻辑。

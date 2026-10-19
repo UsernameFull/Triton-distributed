@@ -74,16 +74,44 @@ set -u
 stage system-prerequisites
 command -v npu-smi >/dev/null || fail 'npu-smi missing; install the Ascend driver first'
 command -v "$PYTHON" >/dev/null || fail "Python not found: $PYTHON"
-# Clang bootstraps the pinned LLVM build; distro clang >=15 is also usable.
-CC=${CC:-$(command -v clang-15 || command -v clang || true)}
-CXX=${CXX:-$(command -v clang++-15 || command -v clang++ || true)}
+# Prefer a compatible pair, including versioned binaries not named "clang".
+compiler_major() {
+    local version
+    version=$("$1" -dumpversion 2>/dev/null) || return 1
+    version=${version%%.*}
+    [[ $version =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$version"
+}
+select_clang() {
+    local c cpp major cpp_major suffix
+    local requested_cc=${CC:-} requested_cxx=${CXX:-}
+    for suffix in custom -15 '' -22 -21 -20 -19 -18 -17 -16; do
+        if [[ $suffix == custom ]]; then
+            [[ -n $requested_cc && -n $requested_cxx ]] || continue
+            c=$requested_cc; cpp=$requested_cxx
+        else
+            c=clang$suffix; cpp=clang++$suffix
+        fi
+        c=$(command -v "$c") || continue
+        cpp=$(command -v "$cpp") || continue
+        major=$(compiler_major "$c") || continue
+        cpp_major=$(compiler_major "$cpp") || continue
+        if (( major >= 15 && major == cpp_major )); then
+            CC=$c; CXX=$cpp
+            return 0
+        fi
+    done
+    return 1
+}
+clang_ready=0
+if select_clang; then clang_ready=1; fi
 LD=${LD:-$(command -v lld-15 || command -v ld.lld || true)}
 missing=0
 for tool in git curl make g++ ccache timeout "${CC:-clang}" "${CXX:-clang++}" "${LD:-ld.lld}"; do
     command -v "$tool" >/dev/null || missing=1
 done
-if (( missing )); then
-    [[ $(id -u) == 0 ]] || fail 'Missing build prerequisites; rerun as root or ask an administrator to install packages listed in --help'
+if (( missing || ! clang_ready )); then
+    [[ $(id -u) == 0 ]] || fail 'Missing or outdated build prerequisites; rerun as root for automatic installation, or provide a compatible CC/CXX pair and install remaining tools listed in --help'
     if command -v apt-get >/dev/null; then
         packages=()
         for package in git curl build-essential clang-15 lld-15 ccache python3-venv python3-dev; do
@@ -91,28 +119,38 @@ if (( missing )); then
                 packages+=("$package")
             fi
         done
+        if (( ! clang_ready )); then
+            # Install the versioned pair alongside old clang; do not replace it.
+            packages+=(clang-15 lld-15)
+        fi
         if (( ${#packages[@]} )); then
             apt-get update
-            apt-get install -y --no-upgrade "${packages[@]}"
+            apt-get install -y "${packages[@]}"
         fi
     elif command -v dnf >/dev/null; then
         packages=()
         for package in git curl gcc gcc-c++ make clang lld ccache python3-devel; do
             if ! rpm -q "$package" >/dev/null 2>&1; then packages+=("$package"); fi
         done
+        if (( ! clang_ready )); then
+            # Installed-but-old packages must remain in this transaction so dnf
+            # can upgrade them to the newest version in configured repositories.
+            packages+=(clang lld)
+        fi
         if (( ${#packages[@]} )); then dnf install -y "${packages[@]}"; fi
     else
         fail 'Unsupported package manager; install build prerequisites manually'
     fi
 fi
-CC=${CC:-$(command -v clang-15 || command -v clang)}
-CXX=${CXX:-$(command -v clang++-15 || command -v clang++)}
-LD=${LD:-$(command -v lld-15 || command -v ld.lld)}
+if ! select_clang; then
+    fail 'Configured repositories did not provide clang/clang++ >=15 with matching major versions. Install a newer LLVM toolchain or enable its distro repository, then set both CC and CXX (and optionally LD); existing build files are retained'
+fi
+if [[ -z $LD ]] || ! command -v "$LD" >/dev/null; then
+    LD=$(command -v lld-15 || command -v ld.lld) || fail 'Install lld or specify LD'
+fi
 "$CC" --version
 "$CXX" --version
 "$LD" --version
-clang_major=$("$CC" -dumpversion | cut -d. -f1)
-[[ $clang_major =~ ^[0-9]+$ && $clang_major -ge 15 ]] || fail 'Bootstrap clang >=15 required'
 # Bootstrap compiler paths are passed explicitly to LLVM, not forced onto SHMEM.
 npu-smi info
 [[ -n ${ASCEND_HOME_PATH:-} && -d $ASCEND_HOME_PATH ]] || fail 'CANN did not set ASCEND_HOME_PATH'
