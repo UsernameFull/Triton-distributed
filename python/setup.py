@@ -888,7 +888,7 @@ _backend_list = ["nvidia", "amd"]
 if _is_maca_platform() and check_env_flag("TRITON_USE_MACA", "OFF"):
     _backend_list.append("metax")
 if _is_ascend_platform() and check_env_flag("TRITON_USE_ASCEND", "OFF"):
-    _backend_list.append("ascend")
+    _backend_list = ["ascend"]
 backends = [*BackendInstaller.copy(_backend_list), *BackendInstaller.copy_externals()]
 
 
@@ -1171,8 +1171,11 @@ def get_packages():
         ]
 
     packages = []
+    # Backend links are created by the wheel hook after setup() evaluates this
+    # list. Include their packages even on a clean first build.
+    backend_packages = {f'triton/backends/{backend.name}' for backend in backends}
     for pkg in _packages:
-        if os.path.exists(pkg):
+        if pkg in backend_packages or os.path.exists(pkg):
             packages.append(pkg)
     return packages
 
