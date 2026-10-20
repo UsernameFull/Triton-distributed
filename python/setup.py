@@ -422,6 +422,9 @@ def get_thirdparty_packages(packages: list):
 
 
 def download_and_copy(name, src_func, dst_path, variable, version, url_func):
+    # CUDA tools are not needed by the explicitly enabled Ascend backend.
+    if check_env_flag("TRITON_USE_ASCEND", "OFF") and _is_ascend_platform():
+        return
     if _is_hip_platform():
         return
     if is_offline_build():

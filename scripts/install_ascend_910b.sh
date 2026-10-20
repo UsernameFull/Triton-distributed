@@ -5,7 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 WORK_DIR=${WORK_DIR:-"${ROOT}/.ascend-910b"}
 CANN_ENV=${CANN_ENV:-}
 PYTHON=${PYTHON:-python3}
-JOBS=${JOBS:-4}
+JOBS=${JOBS:-32}
 TEST_TIMEOUT=${TEST_TIMEOUT:-1800}
 LLVM_COMMIT=fad3272286528b8a491085183434c5ad4b59ab92
 LLVM_PATCH_URL=${LLVM_PATCH_URL:-https://raw.gitcode.com/Ascend/triton-ascend/blobs/2b0a06eb21438359d6d0576b622e3bb5e0292d17/fad3272.patch}
@@ -26,7 +26,7 @@ Environment variables:
   NPUIR_RUNTIME_BIN Optional existing SHMEM-capable runtime compiler bin directory
   NPUIR_RUNTIME_COMMIT Optional runtime source revision (default: fixed August 2026 commit)
   LLVM_INSTALL_PREFIX Optional existing LLVM installation matching docs/build.md
-  JOBS           Parallel build jobs (default: 4)
+  JOBS           Parallel build jobs (default: 32)
   TEST_TIMEOUT   Timeout in seconds per test phase (default: 1800)
   LLVM_SOURCE_ARCHIVE Optional tar.gz from the exact LLVM_COMMIT (GitHub codeload)
   LLVM_PATCH_URL Optional mirror for the documented LLVM patch
@@ -303,17 +303,31 @@ stage ascend-npu-ir
 NPUIR_RUNTIME_COMMIT=${NPUIR_RUNTIME_COMMIT:-f16704a2545db71c75b1a4f9f8c325c3e236954e}
 NPUIR_RUNTIME_DIR=${NPUIR_RUNTIME_DIR:-"$WORK_DIR/npuir-runtime"}
 if [[ -z ${NPUIR_RUNTIME_BIN:-} ]]; then
-    if [[ ! -d $NPUIR_RUNTIME_DIR/.git ]]; then
-        git clone --no-checkout https://gitcode.com/Ascend/AscendNPU-IR.git "$NPUIR_RUNTIME_DIR"
-    fi
-    git -C "$NPUIR_RUNTIME_DIR" checkout "$NPUIR_RUNTIME_COMMIT"
-    git -C "$NPUIR_RUNTIME_DIR" submodule update --init --depth=1
-    (
-        cd "$NPUIR_RUNTIME_DIR"
-        bash build-tools/build.sh -o "$WORK_DIR/npuir-build" -t --build-type Release \
-          --apply-patches --bisheng-compiler="$ASCEND_HOME_PATH/bin" --build-shmem-template -j "$JOBS"
-    )
     NPUIR_RUNTIME_BIN="$WORK_DIR/npuir-build/bin"
+    npuir_marker="$WORK_DIR/npuir-build/.triton-dist-npuir-ready"
+    npuir_config=$(printf '%s\n' "$NPUIR_RUNTIME_COMMIT" "$NPUIR_RUNTIME_DIR" \
+        "$ASCEND_HOME_PATH" 'Release;shmem-template;apply-patches' | sha256sum)
+    if [[ -f $npuir_marker && $(cat "$npuir_marker") == "$npuir_config" ]] &&
+       [[ -x $NPUIR_RUNTIME_BIN/bishengir-compile ]] &&
+       "$NPUIR_RUNTIME_BIN/bishengir-compile" --version >/dev/null 2>&1; then
+        printf 'Reusing NPU IR build: %s\n' "$NPUIR_RUNTIME_BIN"
+    else
+        # An interrupted or changed build must not retain a success marker.
+        rm -f "$npuir_marker"
+        if [[ ! -d $NPUIR_RUNTIME_DIR/.git ]]; then
+            git clone --no-checkout https://gitcode.com/Ascend/AscendNPU-IR.git "$NPUIR_RUNTIME_DIR"
+        fi
+        git -C "$NPUIR_RUNTIME_DIR" checkout "$NPUIR_RUNTIME_COMMIT"
+        git -C "$NPUIR_RUNTIME_DIR" submodule update --init --depth=1
+        (
+            cd "$NPUIR_RUNTIME_DIR"
+            bash build-tools/build.sh -o "$WORK_DIR/npuir-build" -t --build-type Release \
+              --apply-patches --bisheng-compiler="$ASCEND_HOME_PATH/bin" --build-shmem-template -j "$JOBS"
+        )
+        [[ -x $NPUIR_RUNTIME_BIN/bishengir-compile ]] || fail 'bishengir-compile was not produced'
+        "$NPUIR_RUNTIME_BIN/bishengir-compile" --version >/dev/null
+        printf '%s\n' "$npuir_config" > "$npuir_marker"
+    fi
 fi
 [[ -x $NPUIR_RUNTIME_BIN/bishengir-compile ]] || fail 'bishengir-compile was not produced'
 export PATH="$NPUIR_RUNTIME_BIN:$PATH"
