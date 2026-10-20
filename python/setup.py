@@ -888,7 +888,9 @@ _backend_list = ["nvidia", "amd"]
 if _is_maca_platform() and check_env_flag("TRITON_USE_MACA", "OFF"):
     _backend_list.append("metax")
 if _is_ascend_platform() and check_env_flag("TRITON_USE_ASCEND", "OFF"):
-    _backend_list = ["ascend"]
+    # Shared C++ pass registration still depends on NVIDIA and AMD targets.
+    # Keep them enabled so their generated headers and libraries are available.
+    _backend_list.append("ascend")
 backends = [*BackendInstaller.copy(_backend_list), *BackendInstaller.copy_externals()]
 
 
