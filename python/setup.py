@@ -1313,6 +1313,10 @@ DEPS_HIP = ["hip-python"] if _is_hip_platform() else []
 DEPS = DEPS_NVIDIA + DEPS_HIP
 DEPS_TEST = ["nvidia-ml-py>=12.0"] if _is_cuda_platform() else []
 
+# Metadata generation can run egg_info before the wheel hook. Materialize the
+# package layout before setuptools validates packages or enumerates sources.
+add_links(external_only=False)
+
 setup(
     name=os.environ.get("TRITON_WHEEL_NAME", "triton_dist"),
     version="3.4.0" + get_git_version_suffix() + os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", ""),
