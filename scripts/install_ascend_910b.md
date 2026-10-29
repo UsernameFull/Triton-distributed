@@ -75,8 +75,16 @@ bash scripts/install_ascend_910b.sh --prereqs-only
 - Triton 使用仓库锁定的 triton-ascend 和 AscendNPU-IR 头文件，并应用仓库内的两个补丁。
 - 锁定的 IR 头文件版本没有 SHMEM 模板，运行时编译器单独构建固定提交
   `f16704a2545db71c75b1a4f9f8c325c3e236954e`，保留自己的 LLVM 依赖。
+  运行时的 LLVM、torch-mlir 子模块按父仓库锁定的提交直接下载，绕过 GitCode 仓库
+  缺失默认 HEAD 时的克隆错误；已有提交会复用，再将目录纳入 Git 子模块管理。
+  不强制覆盖本地修改，非空目录缺少 Git 元数据时会停止并提示保留文件。
+  NPU IR 构建显式接收已选定的 C/C++ 编译器路径，ASM 使用同一个 C 编译器；
+  避免系统只有 clang-15/clang++-15 时，上游默认 clang/clang++ 无法找到。
+  需重试且已有 CMake 缓存时，通过上游 `--rebuild` 重新配置，保留源码和其余构建产物。
+  Triton wheel 构建也通过追加 CMake 参数传入所选 C/C++ 编译器和 ELF 链接器的完整路径，
+  覆盖 setup.py 中的 clang/clang++/lld 默认名称及旧缓存；链接参数使用同一个 ELF 链接器。
   NPUIR_RUNTIME_COMMIT 可覆盖提交，NPUIR_RUNTIME_BIN 可复用已构建的编译器 bin 目录。
-  成功构建后写入完成标记；提交、源码路径、CANN 路径及构建选项相同且编译器可运行时，
+  成功构建后写入完成标记；提交、源码路径、CANN 路径、C/C++ 编译器路径及构建选项相同且运行时编译器可运行时，
   下次跳过 NPU IR 的下载、子模块更新和编译。仅调整 JOBS 不会触发重建。
   旧版脚本生成的无标记构建首次仍会执行构建；也可通过 NPUIR_RUNTIME_BIN 直接复用。
   删除 `$WORK_DIR/npuir-build/.triton-dist-npuir-ready` 可强制重新执行构建步骤。

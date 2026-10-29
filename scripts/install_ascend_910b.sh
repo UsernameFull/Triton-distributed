@@ -153,7 +153,7 @@ fi
 "$CC" --version
 "$CXX" --version
 "$LD" --version
-# Bootstrap compiler paths are passed explicitly to LLVM, not forced onto SHMEM.
+# Bootstrap compiler paths are passed to LLVM and NPU IR, not forced onto SHMEM.
 npu-smi info
 [[ -n ${ASCEND_HOME_PATH:-} && -d $ASCEND_HOME_PATH ]] || fail 'CANN did not set ASCEND_HOME_PATH'
 find "$ASCEND_HOME_PATH" -maxdepth 2 -name '*version*.cfg' -print 2>/dev/null
@@ -228,6 +228,28 @@ check_clean() {
         rm -f "$expected" "$actual" "$index"
     fi
     fail "Local tracked modifications in $path; preserve them before installing"
+}
+# Some GitCode repositories advertise branches but no default HEAD. Bootstrap
+# their submodules by the parent's gitlink instead of cloning the default branch.
+init_pinned_submodule() {
+    local parent=$1 relative=$2 path revision url
+    path="$parent/$relative"
+    revision=$(git -C "$parent" rev-parse "HEAD:$relative")
+    git -C "$parent" submodule init -- "$relative"
+    url=$(git -C "$parent" config --get "submodule.$relative.url")
+    if [[ ! -e $path/.git ]]; then
+        if [[ -d $path && -n $(find "$path" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+            fail "Nonempty submodule directory without Git metadata: $path; preserve its contents before installing"
+        fi
+        git init "$path"
+        git -C "$path" remote add origin "$url"
+    fi
+    if ! git -C "$path" cat-file -e "$revision^{commit}" 2>/dev/null; then
+        git -C "$path" fetch --depth=1 origin "$revision"
+    fi
+    # A normal checkout preserves local changes or refuses conflicts; never force.
+    git -C "$path" checkout --detach "$revision"
+    git -C "$parent" submodule absorbgitdirs -- "$relative"
 }
 TA="$ROOT/3rdparty/triton-ascend"
 NPUIR="$TA/third_party/ascend/AscendNPU-IR"
@@ -312,7 +334,7 @@ if [[ -z ${NPUIR_RUNTIME_BIN:-} ]]; then
     NPUIR_RUNTIME_BIN="$WORK_DIR/npuir-build/bin"
     npuir_marker="$WORK_DIR/npuir-build/.triton-dist-npuir-ready"
     npuir_config=$(printf '%s\n' "$NPUIR_RUNTIME_COMMIT" "$NPUIR_RUNTIME_DIR" \
-        "$ASCEND_HOME_PATH" 'Release;shmem-template;apply-patches' | sha256sum)
+        "$ASCEND_HOME_PATH" "$CC" "$CXX" 'Release;shmem-template;apply-patches' | sha256sum)
     if [[ -f $npuir_marker && $(cat "$npuir_marker") == "$npuir_config" ]] &&
        [[ -x $NPUIR_RUNTIME_BIN/bishengir-compile ]] &&
        "$NPUIR_RUNTIME_BIN/bishengir-compile" --version >/dev/null 2>&1; then
@@ -324,10 +346,21 @@ if [[ -z ${NPUIR_RUNTIME_BIN:-} ]]; then
             git clone --no-checkout https://gitcode.com/Ascend/AscendNPU-IR.git "$NPUIR_RUNTIME_DIR"
         fi
         git -C "$NPUIR_RUNTIME_DIR" checkout "$NPUIR_RUNTIME_COMMIT"
-        git -C "$NPUIR_RUNTIME_DIR" submodule update --init --depth=1
+        for dependency in llvm-project torch-mlir; do
+            init_pinned_submodule "$NPUIR_RUNTIME_DIR" "third-party/$dependency"
+        done
+        git -C "$NPUIR_RUNTIME_DIR" submodule update --init --depth=1 --jobs=1
         (
             cd "$NPUIR_RUNTIME_DIR"
-            bash build-tools/build.sh -o "$WORK_DIR/npuir-build" -t --build-type Release \
+            # The upstream script skips configuration whenever a cache exists,
+            # even after a failed configure or a compiler change. Regenerate it
+            # while retaining sources and the remaining build artifacts.
+            npuir_reconfigure=()
+            if [[ -f $WORK_DIR/npuir-build/CMakeCache.txt ]]; then
+                npuir_reconfigure+=(--rebuild)
+            fi
+            ASM="$CC" bash build-tools/build.sh -o "$WORK_DIR/npuir-build" -t --build-type Release \
+              --c-compiler "$CC" --cxx-compiler "$CXX" "${npuir_reconfigure[@]}" \
               --apply-patches --bisheng-compiler="$ASCEND_HOME_PATH/bin" --build-shmem-template -j "$JOBS"
         )
         [[ -x $NPUIR_RUNTIME_BIN/bishengir-compile ]] || fail 'bishengir-compile was not produced'
@@ -339,7 +372,21 @@ fi
 export PATH="$NPUIR_RUNTIME_BIN:$PATH"
 export TRITON_USE_ASCEND=ON TRITON_BUILD_WITH_CLANG_LLD=ON
 export TRITON_BUILD_PROTON=OFF TRITON_BUILD_LITTLE_KERNEL=OFF
-export TRITON_APPEND_CMAKE_ARGS='-DTRITON_BUILD_UT=OFF'
+# setup.py's Clang/LLD mode defaults to unversioned binary names. Its appended
+# arguments take precedence, including over compiler paths in an old cache.
+TRITON_APPEND_CMAKE_ARGS=$(python - "$CC" "$CXX" "$(command -v "$LD")" <<'PY'
+import shlex
+import sys
+
+cc, cxx, linker = sys.argv[1:]
+args = ["-DTRITON_BUILD_UT=OFF", f"-DCMAKE_C_COMPILER={cc}",
+        f"-DCMAKE_CXX_COMPILER={cxx}", f"-DCMAKE_LINKER={linker}"]
+args += [f"-DCMAKE_{kind}_LINKER_FLAGS=-fuse-ld={linker}"
+         for kind in ("EXE", "MODULE", "SHARED")]
+print(shlex.join(args))
+PY
+)
+export TRITON_APPEND_CMAKE_ARGS
 stage triton-distributed
 # setup.py enumerates packages before its wheel hook creates this link.
 # Create it before metadata generation, otherwise a first install omits triton/*.py.
