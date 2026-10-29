@@ -238,7 +238,7 @@ triton-ascend depends on specified LLVM version
     -G Ninja \
     -DCMAKE_C_COMPILER=/usr/bin/clang-15 \
     -DCMAKE_CXX_COMPILER=/usr/bin/clang++-15 \
-    -DCMAKE_LINKER=/usr/bin/lld-15 \
+    -DCMAKE_LINKER=/usr/bin/ld.lld-15 \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_ASSERTIONS=ON \
     -DLLVM_ENABLE_PROJECTS="mlir;llvm;lld" \

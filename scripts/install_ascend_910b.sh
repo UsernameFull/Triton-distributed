@@ -20,7 +20,9 @@ Environment variables:
   WORK_DIR       Build, venv and log directory (default: .ascend-910b)
   PYTHON         Base Python with compatible torch/torch_npu (default: python3)
   TORCH_VERSION / TORCH_NPU_VERSION Exact package versions if installing from index
-  CC / CXX / LD  Optional bootstrap tools (default: clang-15 or clang >=15, lld)
+  CC / CXX / LD  Optional bootstrap tools (default: clang-15 or clang >=15, ld.lld-15 or ld.lld)
+  PIP_INDEX_URL  Python package index (default: https://repo.huaweicloud.com/repository/pypi/simple)
+  PIP_DEFAULT_TIMEOUT / PIP_RETRIES Pip timeout in seconds / retries (default: 600 / 10)
   TORCH_WHEEL    Optional exact torch wheel path/URL; use with TORCH_NPU_WHEEL
   TORCH_NPU_WHEEL Optional exact torch_npu wheel path/URL, matched to CANN
   NPUIR_RUNTIME_BIN Optional existing SHMEM-capable runtime compiler bin directory
@@ -105,7 +107,7 @@ select_clang() {
 }
 clang_ready=0
 if select_clang; then clang_ready=1; fi
-LD=${LD:-$(command -v lld-15 || command -v ld.lld || true)}
+LD=${LD:-$(command -v ld.lld-15 || command -v ld.lld || true)}
 missing=0
 for tool in git curl make g++ ccache timeout "${CC:-clang}" "${CXX:-clang++}" "${LD:-ld.lld}"; do
     command -v "$tool" >/dev/null || missing=1
@@ -146,7 +148,7 @@ if ! select_clang; then
     fail 'Configured repositories did not provide clang/clang++ >=15 with matching major versions. Install a newer LLVM toolchain or enable its distro repository, then set both CC and CXX (and optionally LD); existing build files are retained'
 fi
 if [[ -z $LD ]] || ! command -v "$LD" >/dev/null; then
-    LD=$(command -v lld-15 || command -v ld.lld) || fail 'Install lld or specify LD'
+    LD=$(command -v ld.lld-15 || command -v ld.lld) || fail 'Install lld or specify LD'
 fi
 "$CC" --version
 "$CXX" --version
@@ -161,6 +163,10 @@ stage python-environment
 VENV="$WORK_DIR/venv"
 if [[ ! -x $VENV/bin/python ]]; then "$PYTHON" -m venv --system-site-packages "$VENV"; fi
 source "$VENV/bin/activate"
+# Export once so nested builds use the same index and download settings.
+export PIP_INDEX_URL=${PIP_INDEX_URL:-https://repo.huaweicloud.com/repository/pypi/simple}
+export PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT:-600}
+export PIP_RETRIES=${PIP_RETRIES:-10}
 python -m pip install 'setuptools>=40.8.0' wheel 'cmake>=3.20,<4' 'ninja>=1.11.1' 'pybind11>=2.13.1' packaging pytest numpy pyyaml
 if [[ -n ${TORCH_WHEEL:-} ]]; then
     python -m pip install "$TORCH_WHEEL" "$TORCH_NPU_WHEEL"

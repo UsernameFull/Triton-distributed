@@ -35,5 +35,7 @@ WORK_DIR=/data/triton-a3 bash scripts/install_ascend_a3.sh --tests-only
 
 运行环境为 `/data/triton-a3/env.sh`，日志在该目录的 `logs/` 下。
 依赖缺失时的安装、指定 torch wheel、LLVM 源码包和工具链复用参数均与 A2 脚本相同。
+pip 同样默认使用华为源、600 秒超时和 10 次重试，可通过 `PIP_INDEX_URL`、
+`PIP_DEFAULT_TIMEOUT`、`PIP_RETRIES` 覆盖；链接器默认选择 `ld.lld-15` 或 `ld.lld`。
 不能据 A2 测试记录直接选择 A3 的 CANN/torch_npu 版本；应按目标机软件兼容要求准备。
 A2/A3 入口会切换同一个仓库的后端链接并使用同一个 python/build，不要在同一 checkout 并发构建。

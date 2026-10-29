@@ -28,6 +28,11 @@ bash scripts/install_ascend_910b.sh
 ```
 虚拟环境使用 `--system-site-packages` 复用 torch/torch_npu，不是完全隔离环境。
 
+pip 默认使用华为源 `https://repo.huaweicloud.com/repository/pypi/simple`，
+下载超时默认 600 秒、重试 10 次；嵌套构建进程也会继承这些设置。
+可通过 `PIP_INDEX_URL`、`PIP_DEFAULT_TIMEOUT`、`PIP_RETRIES` 覆盖默认值，
+脚本不会修改全局 pip 配置。
+
 只有 CANN、尚无 PyTorch 时，传入与 CANN/Python/主机架构匹配的 wheel：
 
 ```bash
@@ -43,6 +48,7 @@ bash scripts/install_ascend_910b.sh
 
 缺少系统编译工具时，root 下通过 apt-get 或 dnf 安装；普通用户会得到管理员安装提示。
 优先使用 clang-15，否则接受 clang >=15 引导构建指定 LLVM。也可指定 CC、CXX、LD。
+链接器默认选择 `ld.lld-15` 或 `ld.lld`，避免调用通用 `lld-15` 驱动导致版本检查失败。
 手动准备工具的示例：
 
 ```bash
