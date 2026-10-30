@@ -49,6 +49,10 @@ bash scripts/install_ascend_910b.sh
 缺少系统编译工具时，root 下通过 apt-get 或 dnf 安装；普通用户会得到管理员安装提示。
 优先使用 clang-15，否则接受 clang >=15 引导构建指定 LLVM。也可指定 CC、CXX、LD。
 链接器默认选择 `ld.lld-15` 或 `ld.lld`，避免调用通用 `lld-15` 驱动导致版本检查失败。
+apt 安装系统依赖前会检查 `start-stop-daemon`、`dpkg-preconfigure` 和 `update-rc.d`。
+缺失时下载 dpkg、debconf、init-system-helpers，将引导工具解压到临时目录，
+再通过 dpkg 正式恢复软件包并修复未完成的依赖配置；不会直接解包覆盖系统根目录。
+系统管理目录会追加到 PATH，保留已有 Python/CANN 路径；修复结束会清理临时目录。
 手动准备工具的示例：
 
 ```bash

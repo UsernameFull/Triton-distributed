@@ -35,6 +35,7 @@ Environment variables:
 System prerequisites (Debian/Ubuntu example, install as administrator):
   apt-get install git curl build-essential clang-15 lld-15 ccache python3-venv python3-dev
 Missing system prerequisites are installed using apt-get or dnf (root required).
+On apt systems, missing dpkg/debconf/init-system-helpers tools are repaired first.
 CANN and drivers are never updated. --prereqs-only stops after NPU matmul checks.
 EOF
 }
@@ -74,8 +75,42 @@ set +u
 source "$CANN_ENV"
 set -u
 stage system-prerequisites
+# Keep custom Python/CANN paths while making Debian administration tools visible.
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
 command -v npu-smi >/dev/null || fail 'npu-smi missing; install the Ascend driver first'
 command -v "$PYTHON" >/dev/null || fail "Python not found: $PYTHON"
+dpkg_tools_ready() {
+    command -v start-stop-daemon >/dev/null &&
+    command -v update-rc.d >/dev/null &&
+    [[ -x /usr/sbin/dpkg-preconfigure ]]
+}
+repair_debian_tools() (
+    if dpkg_tools_ready; then return 0; fi
+    [[ $(id -u) == 0 ]] || fail 'Missing dpkg helper tools; rerun as root to repair system packages'
+    command -v dpkg >/dev/null || fail 'dpkg missing; restore the container package manager before installing'
+    command -v dpkg-deb >/dev/null || fail 'dpkg-deb missing; restore the container package manager before installing'
+    local repair_dir system_path=$PATH
+    repair_dir=$(mktemp -d "$WORK_DIR/dpkg-repair.XXXXXX")
+    trap 'rm -rf -- "$repair_dir"' EXIT
+    printf 'Repairing missing dpkg/debconf/init-system-helpers tools\n'
+    cd "$repair_dir"
+    apt-get update
+    apt-get download dpkg debconf init-system-helpers
+    # Bootstrap start-stop-daemon only in a temporary directory. Install the
+    # packages through dpkg; never unpack their archives directly over /.
+    dpkg-deb -x ./dpkg_*.deb "$repair_dir/bootstrap"
+    export PATH="$repair_dir/bootstrap/sbin:$repair_dir/bootstrap/usr/sbin:$PATH"
+    command -v start-stop-daemon >/dev/null || fail 'Downloaded dpkg package did not provide start-stop-daemon'
+    dpkg --unpack ./dpkg_*.deb ./debconf_*.deb ./init-system-helpers_*.deb
+    # Resolve dependencies before the final configure pass, including packages
+    # left half-configured by an earlier interrupted installation.
+    apt-get -f install -y
+    dpkg --configure -a
+    export PATH="$system_path"
+    hash -r
+    dpkg_tools_ready || fail 'System package repair did not restore all required dpkg helper tools'
+    printf 'System package repair complete\n'
+)
 # Prefer a compatible pair, including versioned binaries not named "clang".
 compiler_major() {
     local version
@@ -126,6 +161,7 @@ if (( missing || ! clang_ready )); then
             packages+=(clang-15 lld-15)
         fi
         if (( ${#packages[@]} )); then
+            repair_debian_tools
             apt-get update
             apt-get install -y "${packages[@]}"
         fi
