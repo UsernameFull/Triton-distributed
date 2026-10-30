@@ -1,5 +1,21 @@
 # Triton-distributed 双机测试
 
+直接使用 shell 入口，以下 IP 均替换为第一台机器的实际 IPv4 地址：
+
+```bash
+# 第一台
+bash scripts/test_ascend_2nodes.sh 0 10.0.0.1
+# 第二台
+bash scripts/test_ascend_2nodes.sh 1 10.0.0.1
+```
+
+入口自动加载 `.ascend-910b/env.sh`，选择本机 0 号卡，设置双机启动参数及 600 秒总超时。
+自定义安装目录可设置 `WORK_DIR`，卡号通过 `ASCEND_RT_VISIBLE_DEVICES` 指定。
+`MASTER_PORT`、`SHMEM_PORT`、`RUN_TIMEOUT` 可覆盖端口及超时，
+末尾可追加 `--elements N --iterations N --timeout SECONDS`。
+日志写入 `$WORK_DIR/logs/test-2nodes-rank*.log`，保留底层测试的失败退出码。
+Python JIT 测试由 shell 内部启动，无需手动执行 `.py`。
+
 `test_ascend_2nodes.py` 在两台 A2/910B 上各启动一个进程、一张 NPU，
 从 Triton JIT 内核调用 `triton_dist.language.extra.libshmem_device.putmem/getmem`。
 传输引擎使用 ROCE，HCCL 仅用于控制同步和汇总校验状态，不承载被测数据。
